@@ -6,8 +6,14 @@ import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("../../dist-demo/", import.meta.url));
-const MODEL = process.env.MODEL_PATH
-  ?? "C:\\Users\\celso\\AppData\\Local\\Temp\\opencode\\LFM2.5-230M-Q4_K_M.gguf";
+const MODEL = process.env.MODEL_PATH ?? "";
+
+if (!MODEL) {
+  throw new Error(
+    "Set MODEL_PATH to a local GGUF file before running the smoke test, " +
+      "e.g. MODEL_PATH=/path/to/LFM2.5-230M-Q4_K_M.gguf npm run test:browser"
+  );
+}
 
 const consoleErrors = [];
 const pageErrors = [];

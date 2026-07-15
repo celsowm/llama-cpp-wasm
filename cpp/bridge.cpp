@@ -208,7 +208,7 @@ int32_t lcw_format_chat(
         return -3;
     }
 
-    char template_buffer[1 << 16];
+    char template_buffer[1 << 20];
     const int32_t template_length = llama_model_meta_val_str(
         g_model,
         "tokenizer.chat_template",
@@ -219,6 +219,11 @@ int32_t lcw_format_chat(
     if (template_length < 0) {
         set_error("The GGUF model does not contain a supported chat template.");
         return -4;
+    }
+
+    if (template_length > static_cast<int32_t>(sizeof(template_buffer))) {
+        set_error("The model chat template is too large to format.");
+        return -7;
     }
 
     const char * chat_template = template_buffer;

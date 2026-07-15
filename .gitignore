@@ -6,3 +6,6 @@ demo/public/wasm/
 vendor/llama.cpp/
 *.gguf
 .DS_Store
+a.out.js
+a.out.wasm
+

@@ -92,6 +92,9 @@ async function dispatch(message: WorkerRequest): Promise<void> {
         break;
 
       case "unload":
+        if (activeGenerationId !== undefined) {
+          throw new Error("Cannot unload the model during generation.");
+        }
         requireBindings().unload();
         removeModelFile();
         bytesWritten = 0;

@@ -22,13 +22,49 @@ const DEFAULT_LOAD_OPTIONS: Required<LoadOptions> = {
   threads: 1
 };
 
-const DEFAULT_COMPLETION_OPTIONS: Required<CompletionOptions> = {
+const DEFAULT_COMPLETION_OPTIONS: {
+  maxTokens: number;
+  temperature: number;
+  topK: number;
+  topP: number;
+} = {
   maxTokens: 128,
   temperature: 0.7,
   topK: 40,
-  topP: 0.95,
-  seed: 0xffffffff
+  topP: 0.95
 };
+
+/**
+ * A 32-bit seed is drawn at random when the caller does not provide one,
+ * so the default behaviour produces varied output instead of repeating the
+ * same deterministic stream every time.
+ */
+function randomSeed(): number {
+  return (Math.floor(Math.random() * 0xffffffff) >>> 0) || 1;
+}
+
+function sanitizeNumber(
+  value: number | undefined,
+  fallback: number,
+  min: number,
+  name: string
+): number {
+  const resolved = value ?? fallback;
+  if (!Number.isFinite(resolved)) {
+    throw new Error(`Option "${name}" must be a finite number.`);
+  }
+  if (resolved < min) {
+    throw new Error(`Option "${name}" must be greater than or equal to ${min}.`);
+  }
+  return resolved;
+}
+
+function sanitizeSeed(value: number): number {
+  if (!Number.isFinite(value)) {
+    throw new Error(`Option "seed" must be a finite number.`);
+  }
+  return value >>> 0;
+}
 
 export class LlamaCppWasm {
   private readonly worker: Worker;
@@ -84,6 +120,25 @@ export class LlamaCppWasm {
   ): Promise<ModelInfo> {
     this.assertAlive();
 
+    const contextSize = sanitizeNumber(
+      options.contextSize,
+      DEFAULT_LOAD_OPTIONS.contextSize,
+      1,
+      "contextSize"
+    );
+    const batchSize = sanitizeNumber(
+      options.batchSize,
+      DEFAULT_LOAD_OPTIONS.batchSize,
+      1,
+      "batchSize"
+    );
+    const threads = sanitizeNumber(
+      options.threads,
+      DEFAULT_LOAD_OPTIONS.threads,
+      1,
+      "threads"
+    );
+
     const requestId = this.allocateRequestId();
     return this.request<ModelInfo>(
       {
@@ -91,8 +146,9 @@ export class LlamaCppWasm {
         requestId,
         source,
         options: {
-          ...DEFAULT_LOAD_OPTIONS,
-          ...options
+          contextSize,
+          batchSize,
+          threads
         }
       },
       onProgress
@@ -143,15 +199,48 @@ export class LlamaCppWasm {
     this.streams.set(requestId, queue);
     this.activeGenerationId = requestId;
 
+    const merged = { ...DEFAULT_COMPLETION_OPTIONS, ...options };
+    const resolvedOptions: Required<CompletionOptions> = {
+      maxTokens: sanitizeNumber(
+        merged.maxTokens,
+        DEFAULT_COMPLETION_OPTIONS.maxTokens,
+        1,
+        "maxTokens"
+      ),
+      temperature: sanitizeNumber(
+        merged.temperature,
+        DEFAULT_COMPLETION_OPTIONS.temperature,
+        0,
+        "temperature"
+      ),
+      topK: sanitizeNumber(
+        merged.topK,
+        DEFAULT_COMPLETION_OPTIONS.topK,
+        0,
+        "topK"
+      ),
+      topP: sanitizeNumber(
+        merged.topP,
+        DEFAULT_COMPLETION_OPTIONS.topP,
+        0,
+        "topP"
+      ),
+      seed:
+        merged.seed === undefined
+          ? randomSeed()
+          : sanitizeSeed(merged.seed)
+    };
+
+    if (resolvedOptions.topP > 1) {
+      throw new Error(`Option "topP" must be less than or equal to 1.`);
+    }
+
     const message: WorkerRequest = {
       type: "generate",
       requestId,
       prompt: input.prompt,
       chatMessages: input.chatMessages,
-      options: {
-        ...DEFAULT_COMPLETION_OPTIONS,
-        ...options
-      }
+      options: resolvedOptions
     };
 
     this.worker.postMessage(message);
@@ -201,6 +290,12 @@ export class LlamaCppWasm {
 
   async unload(): Promise<void> {
     this.assertAlive();
+
+    if (this.activeGenerationId !== undefined) {
+      throw new Error(
+        "Cannot unload while a generation is running. Cancel it first."
+      );
+    }
 
     const requestId = this.allocateRequestId();
     await this.request<void>({
