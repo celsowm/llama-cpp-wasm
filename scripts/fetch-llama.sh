@@ -5,6 +5,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENDOR_DIR="${ROOT_DIR}/vendor/llama.cpp"
 
 # Current llama.cpp revision used while preparing llama-cpp-wasm 0.0.1.
+#
+# COMPATIBILITY PIN: cpp/bridge.cpp calls llama_chat_apply_template() with the
+# post-refactor signature that takes NO `model` argument. If you bump this
+# commit, verify the llama_chat_apply_template ABI has not changed, otherwise
+# the WASM build will fail (or silently misbehave). Update cpp/bridge.cpp and
+# the lcw_format_chat cwrap signature in src/worker.ts together with any bump.
 LLAMA_CPP_COMMIT="${LLAMA_CPP_COMMIT:-a5822222909b785f23ddc74ce3c8f85bd0e38562}"
 
 mkdir -p "${ROOT_DIR}/vendor"

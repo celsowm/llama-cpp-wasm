@@ -73,6 +73,7 @@ export class LlamaCppWasm {
   private nextRequestId = 1;
   private activeGenerationId?: number;
   private terminated = false;
+  private pendingCancelTimer: ReturnType<typeof setTimeout> | undefined;
 
   private constructor(worker: Worker) {
     this.worker = worker;
@@ -260,6 +261,11 @@ export class LlamaCppWasm {
       const endedNormally = queue.isFinished();
       this.streams.delete(requestId);
 
+      if (this.pendingCancelTimer !== undefined) {
+        clearTimeout(this.pendingCancelTimer);
+        this.pendingCancelTimer = undefined;
+      }
+
       if (this.activeGenerationId === requestId) {
         this.activeGenerationId = undefined;
       }
@@ -286,6 +292,16 @@ export class LlamaCppWasm {
       requestId: this.allocateRequestId(),
       generationId: this.activeGenerationId
     } satisfies WorkerRequest);
+
+    // The worker should acknowledge the cancellation by ending the generation
+    // (posting "done" or "error"). If it never does -- for example because the
+    // WebAssembly worker has hung -- the runtime would otherwise stay wedged on
+    // `activeGenerationId` forever. As a safety net, terminate the worker if
+    // the generation has not finished within a generous timeout.
+    this.pendingCancelTimer = setTimeout(() => {
+      this.pendingCancelTimer = undefined;
+      this.terminate();
+    }, 30000);
   }
 
   async unload(): Promise<void> {
@@ -310,6 +326,12 @@ export class LlamaCppWasm {
     }
 
     this.terminated = true;
+
+    if (this.pendingCancelTimer !== undefined) {
+      clearTimeout(this.pendingCancelTimer);
+      this.pendingCancelTimer = undefined;
+    }
+
     this.worker.terminate();
     this.rejectEverything(new Error("The inference runtime was terminated."));
   }

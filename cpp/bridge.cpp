@@ -228,6 +228,13 @@ int32_t lcw_format_chat(
 
     const char * chat_template = template_buffer;
 
+    // ABI NOTE: this relies on the post-refactor signature
+    //   llama_chat_apply_template(tmpl, messages, n_messages, add_generation_prompt, buf, length)
+    // i.e. WITHOUT the `model` argument. Older llama.cpp revisions used
+    //   llama_chat_apply_template(model, tmpl, messages, n_messages, add_generation_prompt, buf, length)
+    // Bumping LLAMA_CPP_COMMIT in scripts/fetch-llama.sh may change this ABI and
+    // break the build here. If the project is upgraded, update this call (and the
+    // `lcw_format_chat` cwrap signature in the TypeScript worker) accordingly.
     std::vector<llama_chat_message> messages;
     if (system_message != nullptr && system_message[0] != '\0') {
         messages.push_back({"system", system_message});
