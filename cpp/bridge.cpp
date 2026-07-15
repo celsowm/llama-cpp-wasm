@@ -4,12 +4,25 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <string>
 #include <vector>
 
 namespace {
+
+// llama.cpp prints verbose INFO lines while loading a model. Route its logging
+// through a callback that keeps only warnings and errors so the playground
+// console stays readable.
+void lcw_log_callback(enum ggml_log_level level, const char * text, void *) {
+    if (text == nullptr || text[0] == '\0') {
+        return;
+    }
+    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
+        std::fprintf(stderr, "%s", text);
+    }
+}
 
 llama_model * g_model = nullptr;
 llama_context * g_context = nullptr;
@@ -150,6 +163,9 @@ int32_t lcw_load_model(
     clear_model();
     ensure_backend();
 
+    // Silence llama.cpp's verbose load logging (keep warnings/errors only).
+    llama_log_set(lcw_log_callback, nullptr);
+
     g_context_size = std::max<int32_t>(128, context_size);
     g_batch_size = std::max<int32_t>(1, batch_size);
     g_threads = std::max<int32_t>(1, threads);
@@ -184,9 +200,8 @@ int32_t lcw_load_model(
 
 
 EMSCRIPTEN_KEEPALIVE
-int32_t lcw_format_chat(
-    const char * system_message,
-    const char * user_message,
+int32_t lcw_format_chat_multi(
+    const char * messages_serialized,
     uint8_t * output,
     int32_t output_capacity
 ) {
@@ -198,8 +213,8 @@ int32_t lcw_format_chat(
         return -1;
     }
 
-    if (user_message == nullptr || user_message[0] == '\0') {
-        set_error("A non-empty user message is required.");
+    if (messages_serialized == nullptr || messages_serialized[0] == '\0') {
+        set_error("At least one chat message is required.");
         return -2;
     }
 
@@ -208,61 +223,88 @@ int32_t lcw_format_chat(
         return -3;
     }
 
-    char template_buffer[1 << 20];
-    const int32_t template_length = llama_model_meta_val_str(
-        g_model,
-        "tokenizer.chat_template",
-        template_buffer,
-        sizeof(template_buffer)
-    );
+    // The worker serializes the full conversation as records separated by the
+    // Record Separator (0x1E); each record is "role<US>content" where <US> is the
+    // Unit Separator (0x1F). Content may contain newlines.
+    //
+    // We build the ChatML prompt directly (`<|im_start|>`/`<|im_end|>` turns)
+    // instead of using llama.cpp's heuristic template detector. That detector
+    // mis-classifies many modern instruction models and can throw on templates it
+    // does not recognize (e.g. `std::map::at` from `llm_chat_template_from_str`).
+    // The model's BOS is added automatically during tokenization because
+    // `add_bos_token` is true, so we must not emit it here.
+    std::string prompt;
+    int32_t record_count = 0;
 
-    if (template_length < 0) {
-        set_error("The GGUF model does not contain a supported chat template.");
-        return -4;
+    const char * record = messages_serialized;
+    while (true) {
+        const char * record_end = std::strchr(record, '\x1e');
+        const size_t record_len = record_end != nullptr
+            ? static_cast<size_t>(record_end - record)
+            : std::strlen(record);
+
+        if (record_len > 0) {
+            const std::string record_str(record, record_len);
+            const size_t sep = record_str.find('\x1f');
+            const std::string role = sep == std::string::npos
+                ? std::string("user")
+                : record_str.substr(0, sep);
+            const std::string content = sep == std::string::npos
+                ? record_str
+                : record_str.substr(sep + 1);
+
+            std::fprintf(stderr, "[lcw] format_chat_multi: turn #%d role='%s' content_len=%zu\n",
+                record_count, role.c_str(), content.size());
+
+            if (role == "system") {
+                prompt += "<|im_start|>system\n";
+                prompt += content;
+                prompt += "<|im_end|>\n";
+            } else if (role == "assistant") {
+                prompt += "<|im_start|>assistant\n";
+                prompt += content;
+                prompt += "<|im_end|>\n";
+            } else {
+                prompt += "<|im_start|>user\n";
+                prompt += content;
+                prompt += "<|im_end|>\n";
+            }
+            record_count += 1;
+        }
+
+        if (record_end == nullptr) {
+            break;
+        }
+        record = record_end + 1;
     }
 
-    if (template_length > static_cast<int32_t>(sizeof(template_buffer))) {
-        set_error("The model chat template is too large to format.");
-        return -7;
+    // Generation prefix: the model continues generating from here.
+    prompt += "<|im_start|>assistant";
+
+    std::fprintf(stderr, "[lcw] format_chat_multi: built prompt %zu bytes, %d turn(s)\n",
+        prompt.size(), record_count);
+    {
+        const size_t preview = std::min<size_t>(prompt.size(), 256);
+        std::string snippet(preview, '\0');
+        for (size_t i = 0; i < preview; i++) {
+            const char c = prompt[i];
+            snippet[i] = (c == '\n') ? '\\' : c;
+        }
+        std::fprintf(stderr, "[lcw] prompt[0..%zu]=\"%s\"\n", preview, snippet.c_str());
     }
 
-    const char * chat_template = template_buffer;
-
-    // ABI NOTE: this relies on the post-refactor signature
-    //   llama_chat_apply_template(tmpl, messages, n_messages, add_generation_prompt, buf, length)
-    // i.e. WITHOUT the `model` argument. Older llama.cpp revisions used
-    //   llama_chat_apply_template(model, tmpl, messages, n_messages, add_generation_prompt, buf, length)
-    // Bumping LLAMA_CPP_COMMIT in scripts/fetch-llama.sh may change this ABI and
-    // break the build here. If the project is upgraded, update this call (and the
-    // `lcw_format_chat` cwrap signature in the TypeScript worker) accordingly.
-    std::vector<llama_chat_message> messages;
-    if (system_message != nullptr && system_message[0] != '\0') {
-        messages.push_back({"system", system_message});
-    }
-    messages.push_back({"user", user_message});
-
-    const int32_t required = llama_chat_apply_template(
-        chat_template,
-        messages.data(),
-        messages.size(),
-        true,
-        reinterpret_cast<char *>(output),
-        static_cast<size_t>(output_capacity)
-    );
-
-    if (required < 0) {
-        set_error("llama.cpp failed to apply the model chat template.");
-        return -5;
-    }
-
-    if (required > output_capacity) {
+    if (static_cast<int32_t>(prompt.size()) > output_capacity) {
         set_error("The formatted chat prompt exceeds the output buffer.");
         return -6;
     }
 
-    return required;
+    if (!prompt.empty()) {
+        std::memcpy(output, prompt.data(), prompt.size());
+    }
+
+    return static_cast<int32_t>(prompt.size());
     } catch (const std::exception & e) {
-        set_error(std::string("lcw_format_chat: ") + e.what());
+        set_error(std::string("lcw_format_chat_multi: ") + e.what());
         return -100;
     }
 }
@@ -293,6 +335,9 @@ int32_t lcw_start(
 
     const std::string prompt_text(prompt);
     std::vector<llama_token> prompt_tokens = tokenize(prompt_text);
+
+    std::fprintf(stderr, "[lcw] start: prompt_text_len=%zu prompt_tokens=%zu max_tokens=%d temp=%.3f seed=%u\n",
+        prompt_text.size(), prompt_tokens.size(), std::max<int32_t>(0, max_tokens), temperature, seed);
 
     if (prompt_tokens.empty()) {
         set_error("The prompt could not be tokenized.");
@@ -407,6 +452,7 @@ int32_t lcw_next(uint8_t * output, int32_t output_capacity) {
     }
 
     if (g_generated_tokens >= g_max_tokens) {
+        std::fprintf(stderr, "[lcw] next: stop (max_tokens=%d reached)\n", g_max_tokens);
         return 0;
     }
 
@@ -417,7 +463,12 @@ int32_t lcw_next(uint8_t * output, int32_t output_capacity) {
     );
 
     if (llama_vocab_is_eog(g_vocab, token)) {
+        std::fprintf(stderr, "[lcw] next: EOS after %d tokens\n", g_generated_tokens);
         return 0;
+    }
+
+    if (g_generated_tokens < 5) {
+        std::fprintf(stderr, "[lcw] next: token #%d id=%d\n", g_generated_tokens, (int) token);
     }
 
     std::string piece;

@@ -54,6 +54,6 @@ target_link_options(llama_cpp_wasm PRIVATE
     "SHELL:-sMAXIMUM_MEMORY=4294967296"
     "SHELL:-sSTACK_SIZE=5242880"
     "SHELL:-sFORCE_FILESYSTEM=1"
-    "SHELL:-sEXPORTED_FUNCTIONS=['_malloc','_free','_lcw_load_model','_lcw_format_chat','_lcw_start','_lcw_next','_lcw_unload','_lcw_last_error']"
+    "SHELL:-sEXPORTED_FUNCTIONS=['_malloc','_free','_lcw_load_model','_lcw_format_chat_multi','_lcw_start','_lcw_next','_lcw_unload','_lcw_last_error']"
     "SHELL:-sEXPORTED_RUNTIME_METHODS=['FS','cwrap','HEAPU8']"
 )

@@ -31,8 +31,7 @@ interface LlamaModule {
 
 interface Bindings {
   formatChat(
-    systemMessage: string,
-    userMessage: string,
+    messagesSerialized: string,
     outputPointer: number,
     outputCapacity: number
   ): number;
@@ -143,9 +142,9 @@ async function initialize(
 
   bindings = {
     formatChat: cwrap(
-      "lcw_format_chat",
+      "lcw_format_chat_multi",
       "number",
-      ["string", "string", "number", "number"]
+      ["string", "number", "number"]
     ) as Bindings["formatChat"],
 
     loadModel: cwrap(
@@ -334,39 +333,30 @@ function formatChatPrompt(
   const module = requireModule();
   const native = requireBindings();
 
-  const assistantMessages = messages.filter(message => message.role === "assistant");
-  if (assistantMessages.length > 0) {
-    throw new Error(
-      "Version 0.0.2 supports a system message plus one user turn. " +
-      "Multi-turn chat state is planned for 0.0.3."
-    );
-  }
+  // Serialize the full conversation. Each record is "role<US>content" joined by
+  // <RS>. The native side turns this into a ChatML prompt with one turn per
+  // message and an assistant generation prefix at the end.
+  const serialized = messages
+    .map(message => `${message.role}\x1f${message.content}`)
+    .join("\x1e");
 
-  const systemMessages = messages.filter(message => message.role === "system");
-  const userMessages = messages.filter(message => message.role === "user");
-
-  if (systemMessages.length > 1 || userMessages.length !== 1) {
-    throw new Error(
-      "Version 0.0.2 accepts at most one system message and exactly one user message."
-    );
-  }
+  console.warn("[worker] formatChatPrompt: messages=" + messages.length + " serialized_len=" + serialized.length);
 
   const pointer = module._malloc(65536);
   try {
-    const length = native.formatChat(
-      systemMessages[0]?.content ?? "",
-      userMessages[0]?.content ?? "",
-      pointer,
-      65536
-    );
+    const length = native.formatChat(serialized, pointer, 65536);
+
+    console.warn("[worker] formatChatPrompt: native returned length=" + length);
 
     if (length < 0) {
       throw new Error(readNativeError());
     }
 
-    return new TextDecoder().decode(
+    const decoded = new TextDecoder().decode(
       module.HEAPU8.slice(pointer, pointer + length)
     );
+    console.warn("[worker] formatChatPrompt: prompt=" + JSON.stringify(decoded.slice(0, 200)));
+    return decoded;
   } finally {
     module._free(pointer);
   }
