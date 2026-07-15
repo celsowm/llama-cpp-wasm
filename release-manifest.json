@@ -1,0 +1,18 @@
+{
+  "name": "llama-cpp-wasm",
+  "version": "0.0.3",
+  "pages": {
+    "url": "https://celsowm.github.io/llama-cpp-wasm/",
+    "workflow": ".github/workflows/deploy-pages.yml",
+    "trigger": "push to main"
+  },
+  "target_model": {
+    "repo": "LiquidAI/LFM2.5-230M-GGUF",
+    "file": "LFM2.5-230M-Q4_K_M.gguf"
+  },
+  "toolchain": {
+    "node": "24",
+    "emsdk": "4.0.12",
+    "llama_cpp_commit": "a5822222909b785f23ddc74ce3c8f85bd0e38562"
+  }
+}

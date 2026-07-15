@@ -1,0 +1,36 @@
+{
+  "name": "llama-cpp-wasm",
+  "version": "0.0.3",
+  "description": "Minimal browser inference runtime for GGUF models using llama.cpp compiled to WebAssembly.",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./worker": "./dist/worker.js",
+    "./wasm/*": "./dist/wasm/*"
+  },
+  "scripts": {
+    "vendor:llama": "bash scripts/fetch-llama.sh",
+    "build:wasm": "bash scripts/build-wasm.sh",
+    "build:ts": "tsc -p tsconfig.json",
+    "build": "npm run build:wasm && npm run build:ts",
+    "dev": "vite --config vite.config.ts",
+    "build:demo": "vite build --config vite.config.ts",
+    "clean": "rm -rf build dist demo/public/wasm",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run typecheck",
+    "build:pages": "npm run build && npm run build:demo"
+  },
+  "devDependencies": {
+    "playwright": "^1.61.1",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0"
+  }
+}

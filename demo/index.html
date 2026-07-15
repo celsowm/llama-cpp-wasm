@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>llama-cpp-wasm 0.0.1</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">v0.0.3 browser playground</p>
+        <h1>llama-cpp-wasm</h1>
+        <p>
+          Run a small decoder-only GGUF model locally with WASM SIMD.
+          <a href="https://github.com/celsowm/llama-cpp-wasm">View source</a>
+        </p>
+      </header>
+
+      <section class="panel">
+        <label>
+          GGUF model
+          <input id="model" type="file" accept=".gguf" />
+        </label>
+
+        <div class="grid">
+          <label>
+            Context
+            <input id="context" type="number" value="2048" min="128" step="128" />
+          </label>
+
+          <label>
+            Batch
+            <input id="batch" type="number" value="256" min="1" step="1" />
+          </label>
+        </div>
+
+        <div class="buttons">
+          <button id="load">Load local model</button>
+          <button id="loadLfm">Load LFM2.5 230M Q4_K_M</button>
+        </div>
+        <progress id="progress" value="0" max="1"></progress>
+        <p id="status">Choose a small quantized GGUF file.</p>
+      </section>
+
+      <section class="panel">
+        <label>
+          Prompt
+          <textarea id="prompt" rows="8">Hello! Explain WebAssembly in three concise paragraphs.</textarea>
+        </label>
+
+        <div class="grid">
+          <label>
+            Max tokens
+            <input id="maxTokens" type="number" value="128" min="1" />
+          </label>
+
+          <label>
+            Temperature
+            <input id="temperature" type="number" value="0.7" min="0" max="2" step="0.1" />
+          </label>
+        </div>
+
+        <div class="buttons">
+          <button id="generate" disabled>Generate (chat)</button>
+          <button id="generateRaw" disabled>Generate (raw)</button>
+          <button id="cancel" disabled>Cancel</button>
+        </div>
+
+        <pre id="output"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="/main.ts"></script>
+  </body>
+</html>
