@@ -269,6 +269,9 @@ async function generate(
 
   const pointer = module._malloc(OUTPUT_CAPACITY);
   const decoder = new TextDecoder("utf-8", { fatal: false });
+  // Reusable view into the WASM heap so we can decode each token piece without
+  // allocating (and memcpy'ing) a fresh Uint8Array on every iteration.
+  const heapView = module.HEAPU8;
 
   try {
     let tokenCounter = 0;
@@ -286,8 +289,11 @@ async function generate(
 
       const length = result - 1;
       if (length > 0) {
-        const bytes = module.HEAPU8.slice(pointer, pointer + length);
-        const text = decoder.decode(bytes, { stream: true });
+        // Decode directly from the heap; no intermediate copy.
+        const text = decoder.decode(
+          new Uint8Array(heapView.buffer, pointer, length),
+          { stream: true }
+        );
 
         if (text.length > 0) {
           post({
@@ -455,12 +461,21 @@ function readNativeError(): string {
     return "The native inference engine returned an unknown error.";
   }
 
-  const bytes: number[] = [];
-  for (let index = pointer; module.HEAPU8[index] !== 0; index += 1) {
-    bytes.push(module.HEAPU8[index] ?? 0);
+  // Find the NUL terminator in a single pass, then decode a view straight out
+  // of the WASM heap without boxing each byte into a JS Array<number>.
+  let end = pointer;
+  while (module.HEAPU8[end] !== 0) {
+    end += 1;
   }
 
-  return new TextDecoder().decode(new Uint8Array(bytes));
+  const length = end - pointer;
+  if (length <= 0) {
+    return "The native inference engine returned an unknown error.";
+  }
+
+  return new TextDecoder().decode(
+    new Uint8Array(module.HEAPU8.buffer, pointer, length)
+  );
 }
 
 function requireModule(): LlamaModule {
