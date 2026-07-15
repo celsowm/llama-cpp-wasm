@@ -278,8 +278,10 @@ int32_t lcw_format_chat_multi(
         record = record_end + 1;
     }
 
-    // Generation prefix: the model continues generating from here.
-    prompt += "<|im_start|>assistant";
+    // Generation prefix: the model continues generating from here. The LFM2
+    // template emits "<|im_start|>assistant\n" (with a trailing newline), so the
+    // model's first generated token is the start of the reply, not BOS.
+    prompt += "<|im_start|>assistant\n";
 
     std::fprintf(stderr, "[lcw] format_chat_multi: built prompt %zu bytes, %d turn(s)\n",
         prompt.size(), record_count);
@@ -467,13 +469,18 @@ int32_t lcw_next(uint8_t * output, int32_t output_capacity) {
         return 0;
     }
 
-    if (g_generated_tokens < 5) {
-        std::fprintf(stderr, "[lcw] next: token #%d id=%d\n", g_generated_tokens, (int) token);
-    }
-
     std::string piece;
     if (!token_to_bytes(token, piece)) {
         return -3;
+    }
+
+    if (g_generated_tokens < 5) {
+        std::string clean;
+        for (char c : piece) {
+            clean += (c == '\n') ? '\\' : c;
+        }
+        std::fprintf(stderr, "[lcw] next: token #%d id=%d piece=\"%s\" (%zu bytes)\n",
+            g_generated_tokens, (int) token, clean.c_str(), piece.size());
     }
 
     if (piece.size() > static_cast<size_t>(output_capacity)) {

@@ -159,8 +159,7 @@ async function sendMessage(): Promise<void> {
   promptInput.value = "";
   autoGrow(promptInput);
 
-  const assistantEl = appendMessage("assistant", "");
-  const rendered = assistantEl.querySelector(".content") as HTMLElement;
+  const rendered = appendMessage("assistant", "");
 
   busy = true;
   setBusy(true);
@@ -185,7 +184,7 @@ async function sendMessage(): Promise<void> {
     setChatStatus("Ready");
   } catch (error) {
     if (accumulated === "") {
-      assistantEl.remove();
+      rendered.closest(".message")?.remove();
       history.pop();
     } else {
       rendered.innerHTML = renderMarkdown(accumulated);
