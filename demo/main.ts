@@ -1,18 +1,42 @@
-import { LFM25_230M_Q4_K_M, LlamaCppWasm } from "../src/index.ts";
-import type { ChatMessage, ModelInfo } from "../src/index.ts";
+import {
+  LFM25_230M_Q4_K_M,
+  LFM25_1_2B_INSTRUCT_Q4_K_M,
+  LlamaCppWasm
+} from "../src/index.ts";
+import type { ChatMessage, ModelInfo, ModelPreset } from "../src/index.ts";
 import { renderMarkdown } from "./markdown.ts";
 
 const DEFAULT_MAX_TOKENS = 512;
 const DEFAULT_TEMPERATURE = 0.7;
 
+const PRESETS: Record<string, ModelPreset> = {
+  LFM25_230M_Q4_K_M,
+  LFM25_1_2B_INSTRUCT_Q4_K_M
+};
+
+interface Conversation {
+  id: string;
+  title: string;
+  history: ChatMessage[];
+}
+
 const setupScreen = getElement<HTMLElement>("setup");
 const chatScreen = getElement<HTMLElement>("chat");
+const modelSelect = getElement<HTMLSelectElement>("modelSelect");
+const customModelField = getElement<HTMLElement>("customModelField");
 const modelInput = getElement<HTMLInputElement>("model");
 const contextInput = getElement<HTMLInputElement>("context");
 const batchInput = getElement<HTMLInputElement>("batch");
 const loadLfmButton = getElement<HTMLButtonElement>("loadLfm");
 const progress = getElement<HTMLProgressElement>("progress");
 const status = getElement<HTMLParagraphElement>("status");
+
+const sidebar = getElement<HTMLElement>("sidebar");
+const sidebarToggle = getElement<HTMLButtonElement>("sidebarToggle");
+const sidebarReopen = getElement<HTMLButtonElement>("sidebarReopen");
+const conversationsEl = getElement<HTMLElement>("conversations");
+const newChatTop = getElement<HTMLButtonElement>("newChatTop");
+const openSetup = getElement<HTMLButtonElement>("openSetup");
 
 const modelLabel = getElement<HTMLElement>("modelLabel");
 const chatStatus = getElement<HTMLElement>("chatStatus");
@@ -25,21 +49,38 @@ const newChatButton = getElement<HTMLButtonElement>("newChat");
 const unloadButton = getElement<HTMLButtonElement>("unload");
 
 let engine: LlamaCppWasm | undefined;
-let history: ChatMessage[] = [];
 let busy = false;
+let conversations: Conversation[] = [];
+let active: Conversation | undefined;
 
-loadLfmButton.addEventListener("click", async () => {
-  contextInput.value = String(LFM25_230M_Q4_K_M.recommendedContextSize);
-  batchInput.value = String(LFM25_230M_Q4_K_M.recommendedBatchSize);
-  await loadSource({ url: LFM25_230M_Q4_K_M.url }, LFM25_230M_Q4_K_M.label);
+modelSelect.addEventListener("change", () => {
+  customModelField.classList.toggle("hidden", modelSelect.value !== "custom");
 });
 
-modelInput.addEventListener("change", async () => {
-  const file = modelInput.files?.[0];
-  if (!file) {
-    return;
+loadLfmButton.addEventListener("click", async () => {
+  const choice = modelSelect.value;
+  const label = modelSelect.options[modelSelect.selectedIndex].textContent ?? choice;
+
+  let source: { file: File } | { url: string };
+  if (choice === "custom") {
+    const file = modelInput.files?.[0];
+    if (!file) {
+      status.textContent = "Please choose a GGUF file.";
+      return;
+    }
+    source = { file };
+  } else {
+    const preset = PRESETS[choice];
+    if (!preset) {
+      status.textContent = "Unknown model selection.";
+      return;
+    }
+    source = { url: preset.url };
+    contextInput.value = String(preset.recommendedContextSize);
+    batchInput.value = String(preset.recommendedBatchSize);
   }
-  await loadSource({ file }, file.name);
+
+  await loadSource(source, label);
 });
 
 async function loadSource(
@@ -87,10 +128,11 @@ async function loadSource(
       "Loaded " + formatBytes(info.bytesWritten) + ". " +
       "Context " + info.contextSize + ", batch " + info.batchSize + ".";
 
-    history = [];
-    messagesEl.replaceChildren();
     modelLabel.textContent = label;
+    conversations = [];
+    conversationsEl.replaceChildren();
     showChat();
+    startNewChat();
     focusPrompt();
   } catch (error) {
     status.textContent = describeError(error);
@@ -99,6 +141,98 @@ async function loadSource(
   } finally {
     setSetupBusy(false);
   }
+}
+
+function startNewChat(): void {
+  if (busy) {
+    return;
+  }
+
+  messagesEl.replaceChildren();
+  const conversation: Conversation = {
+    id: "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    title: "New chat",
+    history: []
+  };
+  conversations.unshift(conversation);
+  active = conversation;
+
+  renderConversationList();
+  setChatStatus("Ready");
+  focusPrompt();
+}
+
+function renderConversationList(): void {
+  conversationsEl.replaceChildren();
+
+  for (const conversation of conversations) {
+    const row = document.createElement("div");
+    row.className =
+      "conversation" + (conversation === active ? " active" : "");
+    row.title = conversation.title;
+
+    const title = document.createElement("span");
+    title.className = "title";
+    title.textContent = conversation.title;
+
+    const del = document.createElement("button");
+    del.className = "delete";
+    del.type = "button";
+    del.title = "Delete conversation";
+    del.textContent = "×";
+    del.addEventListener("click", event => {
+      event.stopPropagation();
+      deleteConversation(conversation);
+    });
+
+    row.appendChild(title);
+    row.appendChild(del);
+    row.addEventListener("click", () => selectConversation(conversation));
+
+    conversationsEl.appendChild(row);
+  }
+}
+
+function selectConversation(conversation: Conversation): void {
+  if (busy || conversation === active) {
+    return;
+  }
+
+  active = conversation;
+  renderConversationList();
+  renderHistory(conversation.history);
+  setChatStatus("Ready");
+  focusPrompt();
+}
+
+function renderHistory(history: ChatMessage[]): void {
+  messagesEl.replaceChildren();
+  for (const message of history) {
+    appendMessage(message.role, message.content);
+  }
+}
+
+function deleteConversation(conversation: Conversation): void {
+  if (busy) {
+    return;
+  }
+
+  const index = conversations.indexOf(conversation);
+  if (index === -1) {
+    return;
+  }
+  conversations.splice(index, 1);
+
+  if (conversation === active) {
+    if (conversations.length > 0) {
+      selectConversation(conversations[0]);
+    } else {
+      startNewChat();
+    }
+    return;
+  }
+
+  renderConversationList();
 }
 
 composer.addEventListener("submit", async event => {
@@ -123,12 +257,12 @@ cancelButton.addEventListener("click", () => {
 });
 
 newChatButton.addEventListener("click", () => {
-  if (busy) {
-    return;
-  }
-  history = [];
-  messagesEl.replaceChildren();
-  setChatStatus("Ready");
+  startNewChat();
+  focusPrompt();
+});
+
+newChatTop.addEventListener("click", () => {
+  startNewChat();
   focusPrompt();
 });
 
@@ -138,13 +272,35 @@ unloadButton.addEventListener("click", () => {
   }
   engine?.terminate();
   engine = undefined;
-  history = [];
-  messagesEl.replaceChildren();
+  conversations = [];
+  conversationsEl.replaceChildren();
+  active = undefined;
   showSetup();
 });
 
+openSetup.addEventListener("click", () => {
+  if (busy) {
+    engine?.cancel();
+  }
+  engine?.terminate();
+  engine = undefined;
+  showSetup();
+});
+
+sidebarToggle.addEventListener("click", () => {
+  sidebar.classList.add("collapsed");
+  sidebarToggle.classList.add("hidden");
+  sidebarReopen.classList.remove("hidden");
+});
+
+sidebarReopen.addEventListener("click", () => {
+  sidebar.classList.remove("collapsed");
+  sidebarToggle.classList.remove("hidden");
+  sidebarReopen.classList.add("hidden");
+});
+
 async function sendMessage(): Promise<void> {
-  if (busy || !engine) {
+  if (busy || !engine || !active) {
     return;
   }
 
@@ -153,7 +309,12 @@ async function sendMessage(): Promise<void> {
     return;
   }
 
-  history.push({ role: "user", content: text });
+  if (active.title === "New chat") {
+    active.title = text.slice(0, 40);
+    renderConversationList();
+  }
+
+  active.history.push({ role: "user", content: text });
   appendMessage("user", text);
 
   promptInput.value = "";
@@ -168,7 +329,7 @@ async function sendMessage(): Promise<void> {
   let accumulated = "";
 
   try {
-    for await (const chunk of engine.chat(history, {
+    for await (const chunk of engine.chat(active.history, {
       maxTokens: DEFAULT_MAX_TOKENS,
       temperature: DEFAULT_TEMPERATURE,
       topK: 40,
@@ -180,15 +341,15 @@ async function sendMessage(): Promise<void> {
     }
 
     rendered.innerHTML = renderMarkdown(accumulated);
-    history.push({ role: "assistant", content: accumulated });
+    active.history.push({ role: "assistant", content: accumulated });
     setChatStatus("Ready");
   } catch (error) {
     if (accumulated === "") {
       rendered.closest(".message")?.remove();
-      history.pop();
+      active.history.pop();
     } else {
       rendered.innerHTML = renderMarkdown(accumulated);
-      history.push({ role: "assistant", content: accumulated });
+      active.history.push({ role: "assistant", content: accumulated });
     }
     setChatStatus(describeError(error));
   } finally {
@@ -230,11 +391,13 @@ function setBusy(value: boolean): void {
   sendButton.disabled = value;
   promptInput.disabled = value;
   newChatButton.disabled = value;
+  newChatTop.disabled = value;
   cancelButton.classList.toggle("hidden", !value);
 }
 
 function setSetupBusy(value: boolean): void {
   loadLfmButton.disabled = value;
+  modelSelect.disabled = value;
   modelInput.disabled = value;
   contextInput.disabled = value;
   batchInput.disabled = value;

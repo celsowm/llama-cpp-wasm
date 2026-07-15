@@ -13,6 +13,9 @@
   --code-bg: #1e1e22;
   --code-text: #f4f4f5;
 
+  --sidebar-bg: #f7f7f8;
+  --sidebar-border: #e5e5e8;
+
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
@@ -33,7 +36,8 @@ body {
 
 body {
   display: flex;
-  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .hidden {
@@ -89,46 +93,29 @@ body {
   line-height: 1.5;
 }
 
-.model-options {
+.field {
   display: grid;
-  gap: 12px;
-}
-
-.model-card {
-  display: grid;
-  gap: 4px;
-  padding: 16px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: var(--panel);
-  text-align: left;
-  cursor: pointer;
-  font: inherit;
-  color: var(--text);
-  transition: border-color 0.15s ease, transform 0.05s ease;
-}
-
-.model-card:hover {
-  border-color: var(--accent);
-}
-
-.model-card:active {
-  transform: translateY(1px);
-}
-
-.model-card:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.model-name {
-  font-weight: 700;
-  font-size: 1rem;
-}
-
-.model-meta {
+  gap: 6px;
   font-size: 0.85rem;
-  color: var(--muted);
+  font-weight: 700;
+}
+
+.field select,
+.field input[type="file"] {
+  font: inherit;
+  font-weight: 400;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.field select:focus,
+#context:focus,
+#batch:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 
 .advanced {
@@ -156,6 +143,31 @@ body {
   font-weight: 700;
 }
 
+.advanced input {
+  font: inherit;
+  font-weight: 400;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+button.primary {
+  padding: 12px 16px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 progress {
   width: 100%;
 }
@@ -167,15 +179,171 @@ progress {
   font-size: 0.9rem;
 }
 
-/* ---------- Chat screen ---------- */
+/* ---------- ChatGPT-style layout ---------- */
 #chat {
-  height: 100%;
+  flex-direction: row;
+}
+
+.sidebar {
+  width: 280px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--sidebar-border);
+  transition: width 0.2s ease, margin-left 0.2s ease;
+  overflow: hidden;
+}
+
+.sidebar.collapsed {
+  width: 0;
+  margin-left: -1px;
+  border-right: 0;
+}
+
+.sidebar-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--sidebar-border);
+}
+
+.new-chat {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.new-chat:hover {
+  border-color: var(--accent);
+}
+
+.new-chat .plus {
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.icon-btn {
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 1.2rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.icon-btn:hover {
+  border-color: var(--accent);
+}
+
+.conversations {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.conversation {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9rem;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.conversation .title {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conversation:hover {
+  background: rgb(0 0 0 / 0.05);
+}
+
+.conversation.active {
+  background: rgb(0 0 0 / 0.08);
+  font-weight: 600;
+}
+
+.conversation .delete {
+  opacity: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+
+.conversation:hover .delete {
+  opacity: 1;
+}
+
+.conversation .delete:hover {
+  color: #ef4444;
+  background: rgb(239 68 68 / 0.12);
+}
+
+.sidebar-bottom {
+  padding: 10px;
+  border-top: 1px solid var(--sidebar-border);
+}
+
+.ghost-btn {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ghost-btn:hover {
+  border-color: var(--accent);
+}
+
+.chat-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
 }
 
 .chat-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
   padding: 12px 18px;
   border-bottom: 1px solid var(--border);
@@ -187,6 +355,7 @@ progress {
   align-items: baseline;
   gap: 10px;
   min-width: 0;
+  flex: 1;
 }
 
 .chat-title strong {
