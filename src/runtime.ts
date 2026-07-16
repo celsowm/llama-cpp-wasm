@@ -1,5 +1,5 @@
 import { AsyncQueue } from "./async-queue.js";
-import type { WorkerRequest, WorkerResponse } from "./protocol.js";
+import type { BenchmarkReport, WorkerRequest, WorkerResponse } from "./protocol.js";
 import type {
   ChatMessage,
   CompletionOptions,
@@ -7,8 +7,10 @@ import type {
   LoadProgress,
   ModelInfo,
   ModelSource,
-  RuntimeAssets
+  RuntimeAssets,
+  ThreadedRuntimeAssets
 } from "./types.js";
+import { recommendedThreads, supportsThreads } from "./types.js";
 
 interface PendingRequest<T> {
   resolve: (value: T) => void;
@@ -54,7 +56,7 @@ function sanitizeNumber(
     throw new Error(`Option "${name}" must be a finite number.`);
   }
   if (resolved < min) {
-    throw new Error(`Option "${name}" must be greater than or equal to ${min}.`);
+    throw new Error(`Option "maxTokens" must be greater than or equal to ${min}.`);
   }
   return resolved;
 }
@@ -69,11 +71,21 @@ function sanitizeSeed(value: number): number {
 export class LlamaCppWasm {
   private readonly worker: Worker;
   private readonly pending = new Map<number, PendingRequest<unknown>>();
-  private readonly streams = new Map<number, AsyncQueue<string>>();
+  private readonly streams = new Map<
+    number,
+    AsyncQueue<{ text: string; bench?: unknown }>
+  >();
   private nextRequestId = 1;
   private activeGenerationId?: number;
   private terminated = false;
   private pendingCancelTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /**
+   * The most recent benchmark report pushed by the worker via the "done"
+   * message. Undefined if the worker hasn't finished a generation yet (or
+   * the build doesn't expose the topic counters).
+   */
+  lastBench: BenchmarkReport | undefined;
 
   private constructor(worker: Worker) {
     this.worker = worker;
@@ -89,6 +101,48 @@ export class LlamaCppWasm {
   }
 
   static async create(assets: RuntimeAssets): Promise<LlamaCppWasm> {
+    return LlamaCppWasm.createInternal(assets, 1);
+  }
+
+  /**
+   * Creates the worker and picks the single-threaded or multithreaded WASM
+   * artifact at runtime, based on whether the page is cross-origin isolated
+   * and a SharedArrayBuffer is available. When `assets.forceSingleThread` is
+   * true and a single-threaded build is supplied, the ST build is selected
+   * regardless of isolation. The chosen number of threads is exposed on the
+   * returned engine via {@link LlamaCppWasm.defaultThreads}.
+   */
+  static async createThreaded(
+    assets: ThreadedRuntimeAssets
+  ): Promise<LlamaCppWasm> {
+    const wantMt =
+      !assets.forceSingleThread &&
+      assets.moduleUrlMt &&
+      supportsThreads();
+
+    const wantStAvailable = assets.moduleUrlSt !== undefined;
+
+    const useMt = wantMt || !wantStAvailable;
+
+    const chosenModuleUrl = useMt ? assets.moduleUrlMt : (assets.moduleUrlSt ?? assets.moduleUrlMt);
+    const chosenWasmUrl = useMt ? assets.wasmUrlMt : (assets.wasmUrlSt ?? assets.wasmUrlMt);
+
+    const effectiveThreads = (useMt ? recommendedThreads() : 1) || 1;
+    return LlamaCppWasm.createInternal(
+      {
+        moduleUrl: chosenModuleUrl,
+        wasmUrl: chosenWasmUrl,
+        workerUrl: assets.workerUrl,
+        workerFactory: assets.workerFactory
+      },
+      effectiveThreads
+    );
+  }
+
+  private static async createInternal(
+    assets: RuntimeAssets,
+    defaultThreads: number
+  ): Promise<LlamaCppWasm> {
     const worker =
       assets.workerFactory?.() ??
       new Worker(
@@ -100,6 +154,7 @@ export class LlamaCppWasm {
       );
 
     const runtime = new LlamaCppWasm(worker);
+    runtime.defaultThreads = defaultThreads;
     const requestId = runtime.allocateRequestId();
 
     await runtime.request<void>({
@@ -113,6 +168,13 @@ export class LlamaCppWasm {
 
     return runtime;
   }
+
+  /**
+   * The thread count that will be applied to `load()` when `threads` is not
+   * explicit. 1 for the single-threaded build, otherwise
+   * `min(4, navigator.hardwareConcurrency)`.
+   */
+  defaultThreads = 1;
 
   async load(
     source: ModelSource,
@@ -135,7 +197,7 @@ export class LlamaCppWasm {
     );
     const threads = sanitizeNumber(
       options.threads,
-      DEFAULT_LOAD_OPTIONS.threads,
+      this.defaultThreads,
       1,
       "threads"
     );
@@ -173,7 +235,7 @@ export class LlamaCppWasm {
 
     const last = messages[messages.length - 1];
     if (last?.role !== "user") {
-      throw new Error("Version 0.0.2 requires the last chat message to be from the user.");
+      throw new Error("The last chat message must be from the user.");
     }
 
     return this.generate(
@@ -183,6 +245,22 @@ export class LlamaCppWasm {
       },
       options
     );
+  }
+
+  /**
+   * Drops the persistent KV cache and conversation prefix without unloading
+   * the model. Call this when switching to an unrelated sidebar conversation
+   * whose prompt is not a continuation of the current one; otherwise
+   * `lcw_start` will perform an expensive full truncation anyway, but a
+   * reset avoids holding the stale cache in memory.
+   */
+  async resetKV(): Promise<void> {
+    this.assertAlive();
+    if (this.activeGenerationId !== undefined) {
+      throw new Error("Cannot reset the KV cache while a generation is running.");
+    }
+    const requestId = this.allocateRequestId();
+    await this.request<void>({ type: "resetKV", requestId });
   }
 
   private async *generate(
@@ -196,7 +274,7 @@ export class LlamaCppWasm {
     }
 
     const requestId = this.allocateRequestId();
-    const queue = new AsyncQueue<string>();
+    const queue = new AsyncQueue<{ text: string; bench?: unknown }>();
     this.streams.set(requestId, queue);
     this.activeGenerationId = requestId;
 
@@ -254,7 +332,7 @@ export class LlamaCppWasm {
         }
 
         if (item.value !== undefined) {
-          yield item.value;
+          yield item.value.text;
         }
       }
     } finally {
@@ -338,11 +416,14 @@ export class LlamaCppWasm {
 
   private handleResponse(message: WorkerResponse): void {
     if (message.type === "token") {
-      this.streams.get(message.requestId)?.push(message.text);
+      this.streams.get(message.requestId)?.push({ text: message.text });
       return;
     }
 
     if (message.type === "done") {
+      if (message.bench) {
+        this.lastBench = message.bench as BenchmarkReport;
+      }
       this.streams.get(message.requestId)?.end();
       return;
     }
@@ -387,6 +468,11 @@ export class LlamaCppWasm {
 
     if (message.type === "loaded") {
       pending.resolve(message.info);
+      return;
+    }
+
+    if (message.type === "kvReset" || message.type === "unloaded") {
+      pending.resolve(undefined);
       return;
     }
 

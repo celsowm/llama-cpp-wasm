@@ -94,14 +94,16 @@ async function loadSource(
   try {
     engine?.terminate();
 
-    engine = await LlamaCppWasm.create({
+    engine = await LlamaCppWasm.createThreaded({
       workerFactory: () =>
         new Worker(new URL("../src/worker.ts", import.meta.url), {
           type: "module",
           name: "llama-cpp-wasm-playground"
         }),
-      moduleUrl: playgroundAssetUrl("wasm/llama-cpp-wasm.js"),
-      wasmUrl: playgroundAssetUrl("wasm/llama-cpp-wasm.wasm")
+      moduleUrlSt: playgroundAssetUrl("wasm/llama-cpp-wasm-st.js"),
+      wasmUrlSt: playgroundAssetUrl("wasm/llama-cpp-wasm-st.wasm"),
+      moduleUrlMt: playgroundAssetUrl("wasm/llama-cpp-wasm-mt.js"),
+      wasmUrlMt: playgroundAssetUrl("wasm/llama-cpp-wasm-mt.wasm")
     });
 
     status.textContent = "Copying GGUF into the worker…";
@@ -110,8 +112,7 @@ async function loadSource(
       source,
       {
         contextSize: Number(contextInput.value),
-        batchSize: Number(batchInput.value),
-        threads: 1
+        batchSize: Number(batchInput.value)
       },
       update => {
         progress.value = update.ratio ?? 0;
@@ -126,7 +127,8 @@ async function loadSource(
     progress.value = 1;
     status.textContent =
       "Loaded " + formatBytes(info.bytesWritten) + ". " +
-      "Context " + info.contextSize + ", batch " + info.batchSize + ".";
+      "Context " + info.contextSize + ", batch " + info.batchSize + ", " +
+      "threads " + info.threads + ".";
 
     modelLabel.textContent = label;
     conversations = [];
@@ -148,6 +150,9 @@ function startNewChat(): void {
     return;
   }
 
+  if (engine) {
+    void engine.resetKV().catch(() => { /* logged on the worker */ });
+  }
   messagesEl.replaceChildren();
   const conversation: Conversation = {
     id: "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
@@ -199,6 +204,14 @@ function selectConversation(conversation: Conversation): void {
   }
 
   active = conversation;
+  // The persistent KV cache currently holds the previous conversation's
+  // tokens. Since switching to an unrelated sidebar conversation rarely shares
+  // a prefix, clear it instead of forcing `lcw_start` to truncate the entire
+  // cache. Async fire-and-forget; can't race with generation because `busy` is
+  // false (we just returned early above if it was).
+  if (engine) {
+    void engine.resetKV().catch(() => { /* logged on the worker */ });
+  }
   renderConversationList();
   renderHistory(conversation.history);
   setChatStatus("Ready");
@@ -327,6 +340,25 @@ async function sendMessage(): Promise<void> {
   setChatStatus("Generating…");
 
   let accumulated = "";
+  let dirty = false;
+  let rafHandle: number | undefined;
+  let done = false;
+  let startTime = performance.now();
+
+  // Schedule at most one DOM reflow per animation frame. The model produces
+  // several chunks quickly and we must not re-parse the entire accumulated
+  // Markdown on every chunk - the O(n^2) reflow cost dominates long answers.
+  const scheduleRender = (): void => {
+    if (dirty || done) return;
+    dirty = true;
+    rafHandle = requestAnimationFrame(() => {
+      dirty = false;
+      rafHandle = undefined;
+      rendered.innerHTML =
+        renderMarkdown(accumulated) + '<span class="caret"></span>';
+      scrollToBottom();
+    });
+  };
 
   try {
     for await (const chunk of engine.chat(active.history, {
@@ -336,18 +368,30 @@ async function sendMessage(): Promise<void> {
       topP: 0.95
     })) {
       accumulated += chunk;
-      rendered.innerHTML = renderMarkdown(accumulated) + '<span class="caret"></span>';
-      scrollToBottom();
+      scheduleRender();
     }
 
+    // Drain any pending frame before swapping to the final rendering.
+    if (rafHandle !== undefined) {
+      cancelAnimationFrame(rafHandle);
+      rafHandle = undefined;
+    }
+    done = true;
     rendered.innerHTML = renderMarkdown(accumulated);
+    scrollToBottom();
+
     active.history.push({ role: "assistant", content: accumulated });
-    setChatStatus("Ready");
+    setChatStatus(summarizePerformance(engine, startTime, accumulated.length));
   } catch (error) {
+    if (rafHandle !== undefined) {
+      cancelAnimationFrame(rafHandle);
+      rafHandle = undefined;
+    }
     if (accumulated === "") {
       rendered.closest(".message")?.remove();
       active.history.pop();
     } else {
+      done = true;
       rendered.innerHTML = renderMarkdown(accumulated);
       active.history.push({ role: "assistant", content: accumulated });
     }
@@ -453,6 +497,40 @@ function formatBytes(bytes: number): string {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Composes a single-line chat-status string that summarises both wall-clock
+ * and the native-side benchmark counters. Prompt tokens/second is dominated
+ * by llama_decode's prompt batches; generated tokens/second is the
+ * single-token decode rate; time-to-first-token is the prompt phase plus the
+ * wall-clock the worker spent in lcw_start before the first chunk arrived.
+ */
+function summarizePerformance(
+  engine: LlamaCppWasm,
+  startedAt: number,
+  chars: number
+): string {
+  const wallMs = performance.now() - startedAt;
+  const bench = engine.lastBench;
+  const parts: string[] = [
+    `${chars} chars in ${wallMs.toFixed(0)} ms`
+  ];
+  if (bench) {
+    const promptTps = bench.promptMs > 0
+      ? (bench.promptTokens / (bench.promptMs / 1000)).toFixed(1)
+      : "0";
+    const genTps = bench.generateMs > 0
+      ? (bench.generateTokens / (bench.generateMs / 1000)).toFixed(1)
+      : "0";
+    parts.push(`prompt ${promptTps} tok/s`);
+    parts.push(`gen ${genTps} tok/s`);
+    parts.push(`TTFT ${bench.promptMs.toFixed(0)} ms`);
+    if (bench.loadMs > 0) {
+      parts.push(`load ${bench.loadMs.toFixed(0)} ms`);
+    }
+  }
+  return `Ready - ${parts.join(", ")}`;
 }
 
 function playgroundAssetUrl(path: string): string {

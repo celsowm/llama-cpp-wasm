@@ -17,6 +17,11 @@ interface EmscriptenFileSystem {
   unlink(path: string): void;
 }
 
+interface EmscriptenMemory {
+  buffer: ArrayBuffer;
+  grow(delta: number): number;
+}
+
 interface LlamaModule {
   FS: EmscriptenFileSystem;
   HEAPU8: Uint8Array;
@@ -27,6 +32,7 @@ interface LlamaModule {
     returnType: string | null,
     argumentTypes: string[]
   ): (...args: unknown[]) => unknown;
+  wasmMemory?: EmscriptenMemory;
 }
 
 interface Bindings {
@@ -49,21 +55,53 @@ interface Bindings {
     topP: number,
     seed: number
   ): number;
-  next(outputPointer: number, outputCapacity: number): number;
+  generateChunk(
+    outputPointer: number,
+    outputCapacity: number,
+    maxTokens: number
+  ): number;
+  finished(): number;
+  resetKV(): void;
   unload(): void;
   lastError(): number;
+  benchPromptMs(): number;
+  benchGenerateMs(): number;
+  benchPromptTokens(): number;
+  benchGenerateTokens(): number;
+  benchPromptBatch(): number;
+  benchLoadMs(): number;
+}
+
+interface BenchmarkReport {
+  promptMs: number;
+  generateMs: number;
+  promptTokens: number;
+  generateTokens: number;
+  promptBatchSize: number;
+  loadMs: number;
 }
 
 const scope = self as DedicatedWorkerGlobalScope;
 const MODEL_DIRECTORY = "/models";
 const MODEL_PATH = `${MODEL_DIRECTORY}/model.gguf`;
-const OUTPUT_CAPACITY = 4096;
+const OUTPUT_CAPACITY = 8192;
+const CHUNK_TOKENS = 8;
+
+// Auto-unlink the MEMFS model file as soon as llama.cpp has finished loading the
+// tensors. The GGUF bytes are no longer needed by llama.cpp when
+// `use_mmap = false` (the C++ bridge pins that off), so keeping them only
+// inflates peak heap by the model size. The demo's 1.2B preset is the worst
+// offender (~731 MiB retained). Emscripten allows FS.unlink() on an open path,
+// and llama.cpp closes its FILE* before returning from
+// llama_model_load_from_file(), so this is safe immediately after loadModel
+// succeeds. The flag toggles so the smoke test or benchmarks can disable the
+// cleanup for verification if needed.
+const UNLINK_MODEL_AFTER_LOAD = true;
 
 let moduleInstance: LlamaModule | undefined;
 let bindings: Bindings | undefined;
 let activeGenerationId: number | undefined;
 let cancelRequested = false;
-let bytesWritten = 0;
 
 scope.addEventListener("message", event => {
   void dispatch(event.data as WorkerRequest);
@@ -90,17 +128,23 @@ async function dispatch(message: WorkerRequest): Promise<void> {
         }
         break;
 
+      case "resetKV": {
+        if (activeGenerationId !== undefined) {
+          throw new Error("Cannot reset the KV cache while generation is active.");
+        }
+        const b = requireBindings();
+        b.resetKV();
+        post({ type: "kvReset", requestId: message.requestId });
+        break;
+      }
+
       case "unload":
         if (activeGenerationId !== undefined) {
           throw new Error("Cannot unload the model during generation.");
         }
         requireBindings().unload();
         removeModelFile();
-        bytesWritten = 0;
-        post({
-          type: "unloaded",
-          requestId: message.requestId
-        });
+        post({ type: "unloaded", requestId: message.requestId });
         break;
     }
   } catch (error) {
@@ -159,11 +203,23 @@ async function initialize(
       ["string", "number", "number", "number", "number", "number"]
     ) as Bindings["start"],
 
-    next: cwrap(
-      "lcw_next",
+    generateChunk: cwrap(
+      "lcw_generate_chunk",
       "number",
-      ["number", "number"]
-    ) as Bindings["next"],
+      ["number", "number", "number"]
+    ) as Bindings["generateChunk"],
+
+    finished: cwrap(
+      "lcw_finished",
+      "number",
+      []
+    ) as Bindings["finished"],
+
+    resetKV: cwrap(
+      "lcw_reset_kv",
+      null,
+      []
+    ) as Bindings["resetKV"],
 
     unload: cwrap(
       "lcw_unload",
@@ -175,7 +231,43 @@ async function initialize(
       "lcw_last_error",
       "number",
       []
-    ) as Bindings["lastError"]
+    ) as Bindings["lastError"],
+
+    benchPromptMs: cwrap(
+      "lcw_bench_prompt_ms",
+      "number",
+      []
+    ) as Bindings["benchPromptMs"],
+
+    benchGenerateMs: cwrap(
+      "lcw_bench_generate_ms",
+      "number",
+      []
+    ) as Bindings["benchGenerateMs"],
+
+    benchPromptTokens: cwrap(
+      "lcw_bench_prompt_tokens",
+      "number",
+      []
+    ) as Bindings["benchPromptTokens"],
+
+    benchGenerateTokens: cwrap(
+      "lcw_bench_generate_tokens",
+      "number",
+      []
+    ) as Bindings["benchGenerateTokens"],
+
+    benchPromptBatch: cwrap(
+      "lcw_bench_prompt_batch",
+      "number",
+      []
+    ) as Bindings["benchPromptBatch"],
+
+    benchLoadMs: cwrap(
+      "lcw_bench_load_ms",
+      "number",
+      []
+    ) as Bindings["benchLoadMs"]
   };
 
   try {
@@ -200,7 +292,12 @@ async function loadModel(
   native.unload();
   removeModelFile();
 
-  bytesWritten = await writeSourceToMemfs(
+  const totalBytesHint = sourceSizeHint(message.source);
+  if (totalBytesHint > 0) {
+    preGrowHeap(module, totalBytesHint);
+  }
+
+  const bytesWritten = await writeSourceToMemfs(
     module.FS,
     message.source,
     (loadedBytes, totalBytes) => {
@@ -224,6 +321,14 @@ async function loadModel(
     throw new Error(readNativeError());
   }
 
+  if (UNLINK_MODEL_AFTER_LOAD) {
+    try {
+      module.FS.unlink(MODEL_PATH);
+    } catch {
+      // Already gone; harmless.
+    }
+  }
+
   post({
     type: "loaded",
     requestId: message.requestId,
@@ -231,7 +336,9 @@ async function loadModel(
       contextSize: message.options.contextSize,
       batchSize: message.options.batchSize,
       threads: message.options.threads,
-      bytesWritten
+      bytesWritten,
+      loadMs: native.benchLoadMs(),
+      threadsCap: message.options.threads
     }
   });
 }
@@ -269,32 +376,21 @@ async function generate(
 
   const pointer = module._malloc(OUTPUT_CAPACITY);
   const decoder = new TextDecoder("utf-8", { fatal: false });
-  // Reusable view into the WASM heap so we can decode each token piece without
-  // allocating (and memcpy'ing) a fresh Uint8Array on every iteration.
   const heapView = module.HEAPU8;
 
   try {
-    let tokenCounter = 0;
-
     while (!cancelRequested) {
-      const result = native.next(pointer, OUTPUT_CAPACITY);
+      const result = native.generateChunk(pointer, OUTPUT_CAPACITY, CHUNK_TOKENS);
 
       if (result < 0) {
         throw new Error(readNativeError());
       }
 
-      if (result === 0) {
-        break;
-      }
-
-      const length = result - 1;
-      if (length > 0) {
-        // Decode directly from the heap; no intermediate copy.
+      if (result > 0) {
         const text = decoder.decode(
-          new Uint8Array(heapView.buffer, pointer, length),
+          new Uint8Array(heapView.buffer, pointer, result),
           { stream: true }
         );
-
         if (text.length > 0) {
           post({
             type: "token",
@@ -304,12 +400,16 @@ async function generate(
         }
       }
 
-      tokenCounter += 1;
-
-      // Yield to the worker event loop so a cancel message can be observed.
-      if (tokenCounter % 4 === 0) {
-        await delay(0);
+      if (native.finished() !== 0) {
+        break;
       }
+
+      // Yield to the worker event loop between chunks so a cancel message can
+      // be observed. CHUNK_TOKENS is small enough that this still feels
+      // responsive (a 16-token chunk at ~5 tokens/s on the 1.2B model is
+      // ~3 seconds per native call, which would make cancellation laggy).
+      // The 4-token chunk size keeps latency bounded.
+      await delay(0);
     }
 
     const tail = decoder.decode();
@@ -321,9 +421,11 @@ async function generate(
       });
     }
 
+    const bench = readBenchmark(native);
     post({
       type: "done",
-      requestId: message.requestId
+      requestId: message.requestId,
+      bench
     });
   } finally {
     module._free(pointer);
@@ -332,6 +434,16 @@ async function generate(
   }
 }
 
+function readBenchmark(native: Bindings): BenchmarkReport {
+  return {
+    promptMs: native.benchPromptMs(),
+    generateMs: native.benchGenerateMs(),
+    promptTokens: native.benchPromptTokens(),
+    generateTokens: native.benchGenerateTokens(),
+    promptBatchSize: native.benchPromptBatch(),
+    loadMs: native.benchLoadMs()
+  };
+}
 
 function formatChatPrompt(
   messages: NonNullable<Extract<WorkerRequest, { type: "generate" }>["chatMessages"]>
@@ -346,25 +458,57 @@ function formatChatPrompt(
     .map(message => `${message.role}\x1f${message.content}`)
     .join("\x1e");
 
-  console.warn("[worker] formatChatPrompt: messages=" + messages.length + " serialized_len=" + serialized.length);
-
   const pointer = module._malloc(65536);
   try {
     const length = native.formatChat(serialized, pointer, 65536);
-
-    console.warn("[worker] formatChatPrompt: native returned length=" + length);
-
     if (length < 0) {
       throw new Error(readNativeError());
     }
-
     const decoded = new TextDecoder().decode(
       module.HEAPU8.slice(pointer, pointer + length)
     );
-    console.warn("[worker] formatChatPrompt: prompt=" + JSON.stringify(decoded.slice(0, 200)));
     return decoded;
   } finally {
     module._free(pointer);
+  }
+}
+
+// Returns a best-effort lower bound on the GGUF byte size before the actual
+// download/write begins, so the Emscripten heap can be grown once instead of
+// triggering several incremental growth operations while copying the model.
+function sourceSizeHint(source: ModelSource): number {
+  if ("file" in source) {
+    return source.file.size;
+  }
+  return 0;
+}
+
+// Pre-grow the WASM heap by enough to cover the upcoming model copy. Emscripten
+// starts at INITIAL_MEMORY (256 MiB) and grows incrementally under memory
+// pressure when ALLOW_MEMORY_GROWTH is set; for a known-size model that grown
+// path triggers several large memmove()s. Pre-growing bypasses that: one grow,
+// one heap bump, one copy.
+function preGrowHeap(module: LlamaModule, modelBytes: number): void {
+  const mem = module.wasmMemory;
+  if (!mem) {
+    return;
+  }
+
+  const page = 64 * 1024;
+  // 64 MiB headroom is enough so the heap is already larger than the model
+  // leaving room for runtime allocations; growing further while loading the
+  // tensors becomes unlikely.
+  const want = modelBytes + 64 * 1024 * 1024;
+  const current = mem.buffer.byteLength;
+  if (want <= current) {
+    return;
+  }
+  const delta = Math.ceil((want - current) / page);
+  try {
+    mem.grow(delta);
+  } catch {
+    // Growing may fail near the 4 GiB ceiling (MAXIMUM_MEMORY in CMake). Keep
+    // going; the incremental growth machine is still enabled as a fallback.
   }
 }
 

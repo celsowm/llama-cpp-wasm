@@ -76,11 +76,16 @@ jobs:
         run: |
           test -f dist-demo/index.html
           test -f dist-demo/.nojekyll
-          test -f dist-demo/wasm/llama-cpp-wasm.js
-          test -f dist-demo/wasm/llama-cpp-wasm.wasm
+          # The pthread build is the default; ST is a fallback when the host
+          # is not cross-origin isolated.
+          test -f dist-demo/wasm/llama-cpp-wasm-mt.js
+          test -f dist-demo/wasm/llama-cpp-wasm-mt.wasm
+          test -f dist-demo/wasm/llama-cpp-wasm-mt.worker.js
+          test -f dist-demo/wasm/llama-cpp-wasm-st.js
+          test -f dist-demo/wasm/llama-cpp-wasm-st.wasm
 
           if grep -R --line-number \
-            -E '(["'\''])/wasm/llama-cpp-wasm\.(js|wasm)' \
+            -E '(["'\''])/wasm/llama-cpp-wasm(-mt|-st)?\.(js|wasm)' \
             dist-demo; then
             echo "Found a root-relative WASM URL that would break on project Pages." >&2
             exit 1

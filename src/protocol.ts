@@ -7,6 +7,15 @@ import type {
   RuntimeAssets
 } from "./types.js";
 
+export interface BenchmarkReport {
+  promptMs: number;
+  generateMs: number;
+  promptTokens: number;
+  generateTokens: number;
+  promptBatchSize: number;
+  loadMs: number;
+}
+
 export type WorkerRequest =
   | {
       type: "init";
@@ -30,6 +39,10 @@ export type WorkerRequest =
       type: "cancel";
       requestId: number;
       generationId: number;
+    }
+  | {
+      type: "resetKV";
+      requestId: number;
     }
   | {
       type: "unload";
@@ -59,6 +72,11 @@ export type WorkerResponse =
     }
   | {
       type: "done";
+      requestId: number;
+      bench?: BenchmarkReport;
+    }
+  | {
+      type: "kvReset";
       requestId: number;
     }
   | {

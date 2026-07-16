@@ -1,6 +1,6 @@
 {
   "name": "llama-cpp-wasm",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Minimal browser inference runtime for GGUF models using llama.cpp compiled to WebAssembly.",
   "type": "module",
   "license": "MIT",

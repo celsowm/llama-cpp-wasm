@@ -141,9 +141,24 @@ Terminates the worker immediately.
 
 ## Browser deployment
 
-The `0.0.1` binary is single-threaded, so cross-origin isolation is not
-strictly required. The demo already sends COOP/COEP headers to prepare for a
-future pthread build.
+The build emits two artifacts:
+
+```text
+dist/wasm/llama-cpp-wasm-st.js / .wasm
+dist/wasm/llama-cpp-wasm-mt.js / .wasm
+dist/wasm/llama-cpp-wasm-mt.worker.js   (pthread worker; required by the MT build)
+```
+
+The single-threaded build (`llama-cpp-wasm-st`) runs anywhere; the
+multithreaded build (`llama-cpp-wasm-mt`) requires a cross-origin isolated
+page so a `SharedArrayBuffer` is reachable. Use `LlamaCppWasm.createThreaded()`
+to let the runtime pick the right artifact at page load based on
+`typeof SharedArrayBuffer !== "undefined" && crossOriginIsolated`.
+
+The Vite dev server already sends `Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`. The deployed runtime also needs
+those headers (and any cross-origin model URL must return suitable CORS or
+CORP headers).
 
 Your model URL must be same-origin or return suitable CORS headers.
 
@@ -153,8 +168,10 @@ This release does **not** attempt to be a production replacement for native
 `llama.cpp`. It is the smallest useful base for the next steps:
 
 - `0.0.2`: chat templates, model metadata and better error reporting.
-- `0.0.3`: OPFS model cache and URL resume support.
-- `0.1.0`: separate single-thread and pthread binaries.
+- `0.0.3`: GitHub Pages deployment.
+- `0.0.4`: separate single-thread and pthread binaries, chunked native
+  generation, persistent KV cache between turns, batched DOM rendering,
+  MEMFS model unlinking, and benchmark scaffolding.
 - later: WebGPU backend.
 
 ## License
@@ -198,9 +215,14 @@ for await (const text of engine.chat([
 ```
 
 `chat()` delegates formatting to the chat template embedded in the GGUF.
-Version `0.0.2` intentionally accepts only one optional system message and
-one user message. This avoids pretending to support multi-turn KV state before
-that lifecycle is implemented correctly.
+The persistent KV cache is preserved between turns, so turn 10 only
+re-evaluates the new user message rather than re-tokenizing and re-evaluating
+turns 1-9. Call `engine.resetKV()` when switching to an unrelated sidebar
+conversation whose prefix will not match the previous one, to release the
+stale KV cache explicitly instead of forcing `lcw_start` to truncate it.
+
+Version `0.0.4` accepts any number of user/assistant turns (multi-turn chat),
+but the last message must still be from the user.
 
 
 ## GitHub Pages playground
