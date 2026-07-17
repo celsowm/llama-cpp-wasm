@@ -335,6 +335,39 @@ async function sendMessage(): Promise<void> {
 
   const rendered = appendMessage("assistant", "");
 
+  let indicator: HTMLElement | undefined;
+  let indicatorTimer: number | undefined;
+
+  // The prompt-eval phase blocks before any token is produced. Show a
+  // spinner only after a short grace period so a snappy first token does
+  // not flash an unneeded dot. The indicator is cleared on first chunk.
+  const startIndicator = (): void => {
+    if (indicatorTimer !== undefined) return;
+    indicatorTimer = window.setTimeout(() => {
+      indicatorTimer = undefined;
+      indicator = document.createElement("div");
+      indicator.className = "thinking-indicator";
+      indicator.innerHTML =
+        '<span class="dots"><span></span><span></span><span></span></span>' +
+        '<span>Thinking…</span>';
+      rendered.appendChild(indicator);
+      scrollToBottom();
+    }, 200);
+  };
+
+  const stopIndicator = (): void => {
+    if (indicatorTimer !== undefined) {
+      clearTimeout(indicatorTimer);
+      indicatorTimer = undefined;
+    }
+    if (indicator) {
+      indicator.remove();
+      indicator = undefined;
+    }
+  };
+
+  startIndicator();
+
   busy = true;
   setBusy(true);
   setChatStatus("Generating…");
@@ -367,9 +400,14 @@ async function sendMessage(): Promise<void> {
       topK: 40,
       topP: 0.95
     })) {
+      if (accumulated === "") {
+        stopIndicator();
+      }
       accumulated += chunk;
       scheduleRender();
     }
+
+    stopIndicator();
 
     // Drain any pending frame before swapping to the final rendering.
     if (rafHandle !== undefined) {
@@ -383,6 +421,7 @@ async function sendMessage(): Promise<void> {
     active.history.push({ role: "assistant", content: accumulated });
     setChatStatus(summarizePerformance(engine, startTime, accumulated.length));
   } catch (error) {
+    stopIndicator();
     if (rafHandle !== undefined) {
       cancelAnimationFrame(rafHandle);
       rafHandle = undefined;
