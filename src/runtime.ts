@@ -179,7 +179,8 @@ export class LlamaCppWasm {
   async load(
     source: ModelSource,
     options: LoadOptions = {},
-    onProgress?: (progress: LoadProgress) => void
+    onProgress?: (progress: LoadProgress) => void,
+    mmproj?: ModelSource
   ): Promise<ModelInfo> {
     this.assertAlive();
 
@@ -212,7 +213,8 @@ export class LlamaCppWasm {
           contextSize,
           batchSize,
           threads
-        }
+        },
+        mmproj
       },
       onProgress
     );

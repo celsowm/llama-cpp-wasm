@@ -58,8 +58,11 @@ copy_artifact() {
 copy_artifact "llama-cpp-wasm-st" "llama-cpp-wasm-st"
 copy_artifact "llama-cpp-wasm-mt" "llama-cpp-wasm-mt"
 
-# Emscripten also emits a threaded worker (llama-cpp-wasm-mt.worker.js). Copy
-# it next to the module so the runtime can spawn pthreads.
+# Emscripten 6 with EXPORT_ES6 + MODULARIZE no longer emits a standalone
+# pthread worker file. The MT module spawns its pthread pool by re-loading
+# itself via `new Worker(new URL("llama-cpp-wasm-mt.js", import.meta.url),
+# { type: "module" })`, so there is nothing extra to copy here. If a future
+# toolchain reintroduces a separate .worker.js, copy it next to the module.
 worker_file="$(find "${BUILD_DIR}" -type f -name 'llama-cpp-wasm-mt.worker.js' -print -quit)"
 if [[ -n "${worker_file}" ]]; then
   cp "${worker_file}" "${DIST_DIR}/llama-cpp-wasm-mt.worker.js"

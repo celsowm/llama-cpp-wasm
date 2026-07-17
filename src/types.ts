@@ -8,6 +8,17 @@ export type ModelSource =
     };
 
 /**
+ * A decoded still image, ready to be handed to the multimodal (mmproj) path.
+ * The pixels are raw RGB (length === width * height * 3), matching the layout
+ * expected by mtmd's `mtmd_bitmap_init` (RGBRGB... with no padding).
+ */
+export interface ChatImage {
+  data: Uint8Array;
+  width: number;
+  height: number;
+}
+
+/**
  * Runs on the main thread, returns true only when the surrounding document is
  * cross-origin isolated AND a SharedArrayBuffer is actually reachable. Used to
  * decide whether the multithreaded pthread build can run.
@@ -119,6 +130,11 @@ export interface ModelInfo {
    * single-threaded build).
    */
   threadsCap?: number;
+  /**
+   * True when an mmproj projection file was loaded alongside the main model,
+   * enabling image (and audio, for capable models) input.
+   */
+  mmprojLoaded?: boolean;
 }
 
 export interface CompletionOptions {
@@ -135,4 +151,10 @@ export type ChatRole = "system" | "user" | "assistant";
 export interface ChatMessage {
   role: ChatRole;
   content: string;
+  /**
+   * Optional inline images for multimodal models. Gemma 4 expects the image
+   * before the text in a user turn; the runtime inserts a media marker at the
+   * position of the first image and routes the turn through the mmproj path.
+   */
+  images?: ChatImage[];
 }

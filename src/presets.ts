@@ -12,6 +12,16 @@ export interface ModelPreset {
    * harness when tabulating results.
    */
   quantization?: string;
+
+  /**
+   * Optional multimodal projection file (mmproj GGUF) required by vision
+   * models. When present the runtime loads it alongside the main model so the
+   * preset can accept images.
+   */
+  mmproj?: {
+    filename: string;
+    url: string;
+  };
 }
 
 function lfm230mUrl(filename: string): string {
@@ -42,6 +52,28 @@ export const LFM25_1_2B_INSTRUCT_Q4_K_M: ModelPreset = {
   recommendedContextSize: 2048,
   recommendedBatchSize: 256,
   quantization: "Q4_K_M"
+};
+
+function gemma4E2BUrl(filename: string): string {
+  return `https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/${filename}`;
+}
+
+// Google Gemma 4 E2B (effective 2B) multimodal instruction model, QAT Q4_0.
+// It is text+image (and audio on E2B) and requires the mmproj projection file
+// for vision input via the mtmd path.
+export const GEMMA4_E2B_IT_Q4_0: ModelPreset = {
+  id: "google-gemma-4-e2b-it-q4-0",
+  label: "Google Gemma 4 E2B IT Q4_0 (multimodal)",
+  repository: "google/gemma-4-E2B-it-qat-q4_0-gguf",
+  filename: "gemma-4-E2B-it-qat-q4_0.gguf",
+  url: gemma4E2BUrl("gemma-4-E2B-it-qat-q4_0.gguf"),
+  recommendedContextSize: 16384,
+  recommendedBatchSize: 256,
+  quantization: "Q4_0",
+  mmproj: {
+    filename: "gemma-4-E2B-it-mmproj.gguf",
+    url: gemma4E2BUrl("gemma-4-E2B-it-mmproj.gguf")
+  }
 };
 
 /**

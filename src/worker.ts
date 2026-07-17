@@ -1,7 +1,7 @@
 /// <reference lib="webworker" />
 
 import type { WorkerRequest, WorkerResponse } from "./protocol.js";
-import type { ModelSource } from "./types.js";
+import type { ChatImage, ModelSource } from "./types.js";
 
 interface EmscriptenFileSystem {
   mkdir(path: string): void;
@@ -41,11 +41,32 @@ interface Bindings {
     outputPointer: number,
     outputCapacity: number
   ): number;
+  formatChatMm(
+    messagesSerialized: string,
+    outputPointer: number,
+    outputCapacity: number
+  ): number;
   loadModel(
     path: string,
     contextSize: number,
     batchSize: number,
     threads: number
+  ): number;
+  loadMmproj(
+    path: string,
+    threads: number
+  ): number;
+  mmprojLoaded(): number;
+  evalImage(
+    prompt: string,
+    rgbPointer: number,
+    nx: number,
+    ny: number,
+    maxTokens: number,
+    temperature: number,
+    topK: number,
+    topP: number,
+    seed: number
   ): number;
   start(
     prompt: string,
@@ -84,6 +105,7 @@ interface BenchmarkReport {
 const scope = self as DedicatedWorkerGlobalScope;
 const MODEL_DIRECTORY = "/models";
 const MODEL_PATH = `${MODEL_DIRECTORY}/model.gguf`;
+const MMPROJ_PATH = `${MODEL_DIRECTORY}/mmproj.gguf`;
 const OUTPUT_CAPACITY = 8192;
 const CHUNK_TOKENS = 8;
 
@@ -191,11 +213,35 @@ async function initialize(
       ["string", "number", "number"]
     ) as Bindings["formatChat"],
 
+    formatChatMm: cwrap(
+      "lcw_format_chat_mm",
+      "number",
+      ["string", "number", "number"]
+    ) as Bindings["formatChatMm"],
+
     loadModel: cwrap(
       "lcw_load_model",
       "number",
       ["string", "number", "number", "number"]
     ) as Bindings["loadModel"],
+
+    loadMmproj: cwrap(
+      "lcw_load_mmproj",
+      "number",
+      ["string", "number"]
+    ) as Bindings["loadMmproj"],
+
+    mmprojLoaded: cwrap(
+      "lcw_mmproj_loaded",
+      "number",
+      []
+    ) as Bindings["mmprojLoaded"],
+
+    evalImage: cwrap(
+      "lcw_eval_image",
+      "number",
+      ["string", "number", "number", "number", "number", "number", "number", "number", "number"]
+    ) as Bindings["evalImage"],
 
     start: cwrap(
       "lcw_start",
@@ -292,7 +338,8 @@ async function loadModel(
   native.unload();
   removeModelFile();
 
-  const totalBytesHint = sourceSizeHint(message.source);
+  const totalBytesHint =
+    sourceSizeHint(message.source) + (message.mmproj ? sourceSizeHint(message.mmproj) : 0);
   if (totalBytesHint > 0) {
     preGrowHeap(module, totalBytesHint);
   }
@@ -329,6 +376,36 @@ async function loadModel(
     }
   }
 
+  let mmprojLoaded = false;
+  if (message.mmproj) {
+    const mmprojBytes = await writeSourceToMemfs(
+      module.FS,
+      message.mmproj,
+      (loadedBytes, totalBytes) => {
+        post({
+          type: "progress",
+          requestId: message.requestId,
+          loadedBytes,
+          totalBytes
+        });
+      }
+    );
+
+    const mmprojResult = native.loadMmproj(MMPROJ_PATH, message.options.threads);
+    if (mmprojResult !== 0) {
+      throw new Error(readNativeError());
+    }
+    mmprojLoaded = true;
+
+    if (UNLINK_MODEL_AFTER_LOAD) {
+      try {
+        module.FS.unlink(MMPROJ_PATH);
+      } catch {
+        // Already gone; harmless.
+      }
+    }
+  }
+
   post({
     type: "loaded",
     requestId: message.requestId,
@@ -338,7 +415,8 @@ async function loadModel(
       threads: message.options.threads,
       bytesWritten,
       loadMs: native.benchLoadMs(),
-      threadsCap: message.options.threads
+      threadsCap: message.options.threads,
+      mmprojLoaded
     }
   });
 }
@@ -356,18 +434,62 @@ async function generate(
   activeGenerationId = message.requestId;
   cancelRequested = false;
 
-  const generationPrompt = message.chatMessages
-    ? formatChatPrompt(message.chatMessages)
-    : message.prompt;
+  // Multimodal path: exactly one image in the latest user turn. mtmd requires
+  // a single media marker in the prompt, so we only support one image per turn
+  // for now. The image pixels are copied into the WASM heap and passed to
+  // lcw_eval_image, which tokenizes (text + image) and decodes the prefix.
+  const images = message.chatMessages
+    ? lastUserImages(message.chatMessages)
+    : undefined;
 
-  const started = native.start(
-    generationPrompt,
-    message.options.maxTokens,
-    message.options.temperature,
-    message.options.topK,
-    message.options.topP,
-    message.options.seed >>> 0
-  );
+  let started: number;
+  if (images && images.length > 0) {
+    if (native.mmprojLoaded() !== 1) {
+      activeGenerationId = undefined;
+      throw new Error("This model has no mmproj loaded; images are not supported.");
+    }
+    const image = images[0] as ChatImage;
+    if (images.length > 1) {
+      activeGenerationId = undefined;
+      throw new Error("Only one image per turn is supported.");
+    }
+
+    const promptWithMarker = message.chatMessages
+      ? formatChatPromptWithImage(message.chatMessages)
+      : `${mtmdDefaultMarker()}\n${message.prompt}`;
+
+    const rgbPointer = module._malloc(image.data.byteLength);
+    module.HEAPU8.set(image.data, rgbPointer);
+
+    try {
+      started = native.evalImage(
+        promptWithMarker,
+        rgbPointer,
+        image.width,
+        image.height,
+        message.options.maxTokens,
+        message.options.temperature,
+        message.options.topK,
+        message.options.topP,
+        message.options.seed >>> 0
+      );
+    } finally {
+      module._free(rgbPointer);
+    }
+  } else {
+    const generationPrompt = message.chatMessages
+      ? formatChatPrompt(message.chatMessages)
+      : message.prompt;
+
+    started = native.start(
+      generationPrompt,
+      message.options.maxTokens,
+      message.options.temperature,
+      message.options.topK,
+      message.options.topP,
+      message.options.seed >>> 0
+    );
+  }
 
   if (started !== 0) {
     activeGenerationId = undefined;
@@ -453,7 +575,9 @@ function formatChatPrompt(
 
   // Serialize the full conversation. Each record is "role<US>content" joined by
   // <RS>. The native side turns this into a ChatML prompt with one turn per
-  // message and an assistant generation prefix at the end.
+  // message and an assistant generation prefix at the end. This path is only
+  // reached when no images are present (see formatChatPromptWithImage for the
+  // multimodal case), so the content is plain text with no media marker.
   const serialized = messages
     .map(message => `${message.role}\x1f${message.content}`)
     .join("\x1e");
@@ -468,6 +592,63 @@ function formatChatPrompt(
       module.HEAPU8.slice(pointer, pointer + length)
     );
     return decoded;
+  } finally {
+    module._free(pointer);
+  }
+}
+
+// The mtmd default media marker ("<__media__>") inserted into the prompt at the
+// position of each image. Must stay in sync with mtmd_default_marker() in the
+// vendored llama.cpp tree.
+function mtmdDefaultMarker(): string {
+  return "<__media__>";
+}
+
+// Returns the images attached to the latest user turn, or undefined when there
+// are none. Only one image per turn is supported by lcw_eval_image, so the
+// generate path throws if more than one is present.
+function lastUserImages(
+  messages: NonNullable<Extract<WorkerRequest, { type: "generate" }>["chatMessages"]>
+): ChatImage[] | undefined {
+  for (let i = messages.length - 1; i >= 0; --i) {
+    const message = messages[i];
+    if (message && message.role === "user" && message.images && message.images.length > 0) {
+      return message.images;
+    }
+  }
+  return undefined;
+}
+
+// Build the prompt for a single-image user turn. When an mmproj is loaded we
+// use the model's own chat template (lcw_format_chat_mm) so the media marker is
+// placed inside a correctly-formatted Gemma 4 turn. Without an mmproj the image
+// path cannot run, but we still fall back to the ChatML formatter for safety.
+function formatChatPromptWithImage(
+  messages: NonNullable<Extract<WorkerRequest, { type: "generate" }>["chatMessages"]>
+): string {
+  const module = requireModule();
+  const native = requireBindings();
+
+  const serialized = messages
+    .map(message => {
+      if (message.images && message.images.length > 0) {
+        const text = message.content.length > 0 ? `\n${message.content}` : "";
+        return `${message.role}\x1f${mtmdDefaultMarker()}${text}`;
+      }
+      return `${message.role}\x1f${message.content}`;
+    })
+    .join("\x1e");
+
+  const pointer = module._malloc(65536);
+  try {
+    const formatter = native.mmprojLoaded() === 1
+      ? native.formatChatMm
+      : native.formatChat;
+    const length = formatter(serialized, pointer, 65536);
+    if (length < 0) {
+      throw new Error(readNativeError());
+    }
+    return new TextDecoder().decode(module.HEAPU8.slice(pointer, pointer + length));
   } finally {
     module._free(pointer);
   }
@@ -589,10 +770,15 @@ function removeModelFile(): void {
     return;
   }
 
-  try {
-    moduleInstance.FS.unlink(MODEL_PATH);
-  } catch {
-    // No model file exists.
+  // Drop both the main model and any mmproj file from MEMFS so a second load
+  // of a non-multimodal model does not keep a stale ~3 GiB blob around (and
+  // does not pick up the wrong projection on the next load).
+  for (const path of [MODEL_PATH, MMPROJ_PATH]) {
+    try {
+      moduleInstance.FS.unlink(path);
+    } catch {
+      // No file at this path; harmless.
+    }
   }
 }
 

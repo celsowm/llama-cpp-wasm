@@ -25,11 +25,33 @@ set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 set(LLAMA_WASM_MEM64 OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_HTML OFF CACHE BOOL "" FORCE)
 
+# Multimodal support: the vendored llama.cpp gates tools/mtmd behind an
+# `if (EMSCRIPTEN) else()` block in tools/CMakeLists.txt, so under Emscripten
+# the mtmd library is NOT built by the upstream build. We pull it in
+# ourselves by adding the mtmd subdirectory directly (after libllama is
+# configured). mtmd's own CMakeLists.txt is self-contained: it declares the
+# `mtmd` library target and links ggml + llama. This bypasses the upstream
+# Emscripten gate without touching the pinned vendor tree.
+# MTMD_VIDEO requires ffmpeg/ffprobe at runtime; we are image-only, so disable
+# it at build time to keep the dependency surface minimal.
+set(MTMD_VIDEO OFF CACHE BOOL "" FORCE)
+
 set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
 
+# The vendored ggml/llama/mtmd static libraries are compiled once and linked
+# into BOTH the single-threaded and the pthread (MT) executables. Emscripten's
+# wasm-ld rejects a `--shared-memory` link (used by the MT target) if any
+# object was not compiled with the `atomics`/`bulk-memory` features. Compiling
+# the libraries with -pthread emits those features; the resulting objects still
+# link cleanly into the non-shared-memory ST target, so a single set of .a
+# files serves both builds. Applied as a directory-scope option BEFORE
+# add_subdirectory so the vendored targets inherit it.
+add_compile_options(-pthread)
+
 add_subdirectory(vendor/llama.cpp)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/mtmd-shim.cmake)
 
 # Common Emscripten link flags shared by both single-thread and pthread
 # builds. The list is factored so the per-targets only need to add their
@@ -51,6 +73,7 @@ set(LCW_LINK_OPTIONS_COMMON
     "SHELL:-sEXPORTED_FUNCTIONS=['_malloc','_free',\
 '_lcw_load_model',\
 '_lcw_format_chat_multi',\
+'_lcw_format_chat_mm',\
 '_lcw_start',\
 '_lcw_generate_chunk',\
 '_lcw_finished',\
@@ -62,6 +85,9 @@ set(LCW_LINK_OPTIONS_COMMON
 '_lcw_bench_prompt_tokens',\
 '_lcw_bench_generate_tokens',\
 '_lcw_bench_prompt_batch',\
+'_lcw_load_mmproj',\
+'_lcw_eval_image',\
+'_lcw_mmproj_loaded',\
 '_lcw_bench_load_ms']"
     "SHELL:-sEXPORTED_RUNTIME_METHODS=['FS','cwrap','HEAPU8','wasmMemory']"
 )
@@ -70,7 +96,7 @@ set(LCW_LINK_OPTIONS_COMMON
 # single-threaded build: llama-cpp-wasm-st.js / .wasm
 # ---------------------------------------------------------------------------
 add_executable(llama_cpp_wasm_st cpp/bridge.cpp)
-target_link_libraries(llama_cpp_wasm_st PRIVATE llama)
+target_link_libraries(llama_cpp_wasm_st PRIVATE llama mtmd)
 target_compile_options(llama_cpp_wasm_st PRIVATE -O3 -msimd128 -fexceptions)
 
 set_target_properties(llama_cpp_wasm_st PROPERTIES
@@ -89,7 +115,7 @@ target_link_options(llama_cpp_wasm_st PRIVATE ${LCW_LINK_OPTIONS_COMMON})
 # When no growth is allowed, INITIAL_MEMORY must be larger to accommodate the
 # pthread stack pool; here growth absorbs the difference at runtime.
 add_executable(llama_cpp_wasm_mt cpp/bridge.cpp)
-target_link_libraries(llama_cpp_wasm_mt PRIVATE llama)
+target_link_libraries(llama_cpp_wasm_mt PRIVATE llama mtmd)
 target_compile_options(llama_cpp_wasm_mt PRIVATE
     -O3
     -msimd128

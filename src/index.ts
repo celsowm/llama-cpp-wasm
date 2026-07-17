@@ -1,6 +1,7 @@
 export { LlamaCppWasm } from "./runtime.js";
 
 export type {
+  ChatImage,
   ChatMessage,
   ChatRole,
   CompletionOptions,
@@ -25,6 +26,7 @@ export {
   LFM25_230M_Q4_K_S,
   LFM25_230M_Q5_0,
   LFM25_230M_Q8_0,
-  LFM25_230M_QUANTIZATION_PRESETS
+  LFM25_230M_QUANTIZATION_PRESETS,
+  GEMMA4_E2B_IT_Q4_0
 } from "./presets.js";
 export type { ModelPreset } from "./presets.js";

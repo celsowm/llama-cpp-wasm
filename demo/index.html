@@ -90,6 +90,10 @@
 
         <form id="composer" class="composer">
           <textarea id="prompt" rows="1" placeholder="Send a message…  (Enter to send, Shift+Enter for newline)"></textarea>
+          <label id="attachLabel" class="attach" title="Attach an image">
+            <input id="attach" type="file" accept="image/*" hidden />
+            <span>📎</span>
+          </label>
           <button type="submit" id="send">Send</button>
           <button type="button" id="cancel" class="hidden">Stop</button>
         </form>

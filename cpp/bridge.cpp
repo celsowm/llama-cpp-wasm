@@ -1,4 +1,6 @@
 #include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 
 #include <emscripten.h>
 
@@ -9,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -46,6 +49,11 @@ llama_model * g_model = nullptr;
 llama_context * g_context = nullptr;
 llama_sampler * g_sampler = nullptr;
 const llama_vocab * g_vocab = nullptr;
+
+// Multimodal context (mtmd). May remain nullptr if no mmproj file was loaded;
+// the lcw_eval_image entry will reject calls in that case. Owned through the
+// unique_ptr deleter below.
+mtmd_context * g_mtmd = nullptr;
 
 std::string g_last_error;
 int32_t g_context_size = 2048;
@@ -139,6 +147,11 @@ void clear_model() {
     if (g_context != nullptr) {
         llama_free(g_context);
         g_context = nullptr;
+    }
+
+    if (g_mtmd != nullptr) {
+        mtmd_free(g_mtmd);
+        g_mtmd = nullptr;
     }
 
     if (g_model != nullptr) {
@@ -334,6 +347,217 @@ int32_t lcw_load_model(
 }
 
 EMSCRIPTEN_KEEPALIVE
+int32_t lcw_load_mmproj(
+    const char * mmproj_path,
+    int32_t threads
+) {
+    g_last_error.clear();
+
+    if (mmproj_path == nullptr || mmproj_path[0] == '\0') {
+        set_error("An mmproj path is required.");
+        return -1;
+    }
+
+    if (g_model == nullptr) {
+        set_error("Load the main model before loading the mmproj.");
+        return -2;
+    }
+
+    // Free any previously loaded projection so a second load replaces it.
+    if (g_mtmd != nullptr) {
+        mtmd_free(g_mtmd);
+        g_mtmd = nullptr;
+    }
+
+    mtmd_context_params mm_params = mtmd_context_params_default();
+    mm_params.use_gpu = false;
+    mm_params.n_threads = std::max<int32_t>(1, threads);
+    mm_params.warmup = false;
+
+    timing_block t(g_bench_load_ms);
+    g_mtmd = mtmd_init_from_file(mmproj_path, g_model, mm_params);
+    if (g_mtmd == nullptr) {
+        t.disable();
+        set_error("llama.cpp could not load the mmproj projection file.");
+        return -3;
+    }
+
+    if (!mtmd_support_vision(g_mtmd)) {
+        set_error("The mmproj file does not expose a vision projection.");
+        mtmd_free(g_mtmd);
+        g_mtmd = nullptr;
+        return -4;
+    }
+
+    return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int32_t lcw_mmproj_loaded() {
+    return g_mtmd != nullptr ? 1 : 0;
+}
+
+// Evaluate a text prompt that embeds one image. The prompt must contain exactly
+// one media marker (`mtmd_default_marker()`, normally "<__media__>") where the
+// image is to be inserted. The image is supplied as raw RGB pixels (length ==
+// width * height * 3). On success the resulting text/image KV state is appended
+// to the persistent prefix exactly like lcw_start does for text turns, so
+// subsequent text turns can reuse it.
+//
+// Returns:
+//    0  success
+//   <0  error (see lcw_last_error)
+EMSCRIPTEN_KEEPALIVE
+int32_t lcw_eval_image(
+    const char * prompt,
+    uint8_t * rgb,
+    uint32_t nx,
+    uint32_t ny,
+    int32_t max_tokens,
+    float temperature,
+    int32_t top_k,
+    float top_p,
+    uint32_t seed
+) {
+    g_last_error.clear();
+
+    try {
+    if (g_model == nullptr || g_vocab == nullptr || g_context == nullptr) {
+        set_error("Load a model before starting generation.");
+        return -1;
+    }
+
+    if (g_mtmd == nullptr) {
+        set_error("Load an mmproj file before evaluating an image prompt.");
+        return -2;
+    }
+
+    if (prompt == nullptr || rgb == nullptr || nx == 0 || ny == 0) {
+        set_error("An image prompt requires text, pixels, width and height.");
+        return -3;
+    }
+
+    const std::string prompt_text(prompt);
+
+    mtmd_input_text text;
+    text.text = prompt_text.c_str();
+    text.text_len = prompt_text.size();
+    text.add_special = false;
+    text.parse_special = true;
+
+    // Use the raw C API rather than the mtmd:: C++ wrappers: the wrapper types
+    // (mtmd::bitmap, mtmd::input_chunks) hold a unique_ptr whose deleter is
+    // instantiated with a forward-declared struct, and constructing/accessing
+    // .ptr triggers incomplete-type compile errors. The C API is fine to use
+    // directly from C++ and matches the rest of the bridge's style.
+    mtmd_bitmap * image_bitmap = mtmd_bitmap_init(nx, ny, rgb);
+    if (image_bitmap == nullptr) {
+        set_error("Could not allocate the image bitmap.");
+        return -4;
+    }
+
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    if (chunks == nullptr) {
+        mtmd_bitmap_free(image_bitmap);
+        set_error("Could not allocate the input chunks container.");
+        return -5;
+    }
+
+    // mtmd_tokenize expects `const mtmd_bitmap **`; take the address of a
+    // const pointer so the conversion is exact without a C-style cast.
+    const mtmd_bitmap * bitmap_view = image_bitmap;
+    const int32_t tok_res = mtmd_tokenize(
+        g_mtmd, chunks, &text, &bitmap_view, 1);
+    mtmd_bitmap_free(image_bitmap);
+    if (tok_res != 0) {
+        mtmd_input_chunks_free(chunks);
+        set_error("mtmd_tokenize failed (marker/image count mismatch?).");
+        return -6;
+    }
+
+    g_max_tokens = std::max<int32_t>(0, max_tokens);
+    if (g_max_tokens == 0) {
+        g_max_tokens = 128;
+    }
+    g_generated_tokens = 0;
+
+    g_bench_prompt_ms = 0.0;
+    g_bench_generate_ms = 0.0;
+    g_bench_prompt_tokens = 0;
+    g_bench_generate_tokens = 0;
+    g_bench_prompt_batch = g_batch_size;
+
+    // For multimodal turns we do not attempt prefix reuse across turns: image
+    // prompts carry their own marker and the previous text/visual prefix is not
+    // necessarily a prefix of this new sequence. Reset the KV cache so the new
+    // prompt is evaluated from scratch.
+    {
+        llama_memory_t mem = llama_get_memory(g_context);
+        if (mem != nullptr) {
+            llama_memory_clear(mem, true);
+        }
+        g_prefix_tokens.clear();
+    }
+
+    llama_pos n_past = 0;
+    const size_t n_chunks = mtmd_input_chunks_size(chunks);
+    for (size_t i = 0; i < n_chunks; ++i) {
+        const mtmd_input_chunk * chunk =
+            mtmd_input_chunks_get(chunks, i);
+
+        // Only the final chunk should leave logits computed on its last
+        // position so the sampler attached by build_sampler below can draw
+        // from them. Intermediate chunks must run with logits_last=false to
+        // avoid wasting compute on positions the sampler never reads.
+        const bool is_last = (i + 1 == n_chunks);
+
+        timing_block t(g_bench_prompt_ms);
+        const int32_t eval_res = mtmd_helper_eval_chunk_single(
+            g_mtmd,
+            g_context,
+            chunk,
+            n_past,
+            0,
+            g_batch_size,
+            is_last,
+            &n_past);
+        if (eval_res != 0) {
+            mtmd_input_chunks_free(chunks);
+            reset_generation_state();
+            set_error("Evaluating an image/text chunk failed.");
+            return -7;
+        }
+    }
+
+    // Free the chunks container now that the KV cache has consumed them. The
+    // chunk data was decoded into g_context, so the container's own memory is
+    // safe to release.
+    mtmd_input_chunks_free(chunks);
+
+    // Record the evaluated tokens into the persistent prefix so the generation
+    // loop (lcw_generate_chunk) can continue from n_past and so the next text
+    // turn that shares this prefix reuses the visual state.
+    g_prefix_tokens.resize(static_cast<size_t>(n_past));
+
+    g_bench_prompt_tokens = static_cast<int32_t>(n_past);
+
+    std::fprintf(stderr,
+        "[lcw] eval_image: chunks=%zu n_past=%d max_tokens=%d\n",
+        n_chunks, n_past, g_max_tokens);
+
+    if (!build_sampler(temperature, top_k, top_p, seed)) {
+        return -8;
+    }
+
+    g_generation_active = true;
+    return 0;
+    } catch (const std::exception & e) {
+        set_error(std::string("lcw_eval_image: ") + e.what());
+        return -100;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
 int32_t lcw_format_chat_multi(
     const char * messages_serialized,
     uint8_t * output,
@@ -426,6 +650,113 @@ int32_t lcw_format_chat_multi(
     return static_cast<int32_t>(prompt.size());
     } catch (const std::exception & e) {
         set_error(std::string("lcw_format_chat_multi: ") + e.what());
+        return -100;
+    }
+}
+
+// Formats a chat conversation using the model's own (built-in) chat template
+// rather than the ChatML fallback used by lcw_format_chat_multi. This is
+// required for multimodal models (e.g. Gemma 4) whose template differs from
+// ChatML and which embed a media marker (`<__media__>`) where images go. The
+// worker passes image turns serialized as "user<US><__media__><US>text", so the
+// marker lands inside the rendered user turn and mtmd_tokenize can expand it.
+//
+// Returns the number of bytes written, or a negative error code.
+EMSCRIPTEN_KEEPALIVE
+int32_t lcw_format_chat_mm(
+    const char * messages_serialized,
+    uint8_t * output,
+    int32_t output_capacity
+) {
+    g_last_error.clear();
+
+    try {
+    if (g_model == nullptr) {
+        set_error("Load a model before formatting chat messages.");
+        return -1;
+    }
+
+    if (messages_serialized == nullptr || messages_serialized[0] == '\0') {
+        set_error("At least one chat message is required.");
+        return -2;
+    }
+
+    if (output == nullptr || output_capacity <= 0) {
+        set_error("The chat output buffer is invalid.");
+        return -3;
+    }
+
+    const char * tmpl = llama_model_chat_template(g_model, nullptr);
+    if (tmpl == nullptr) {
+        set_error("The model does not expose a chat template.");
+        return -4;
+    }
+
+    // Parse "role<US>content" records separated by <RS>. Image turns carry a
+    // <__media__> marker inside the content, emitted by the worker.
+    std::vector<llama_chat_message> chat;
+    std::vector<std::string> role_storage;
+    std::vector<std::string> content_storage;
+
+    const char * record = messages_serialized;
+    while (true) {
+        const char * record_end = std::strchr(record, '\x1e');
+        const size_t record_len = record_end != nullptr
+            ? static_cast<size_t>(record_end - record)
+            : std::strlen(record);
+
+        if (record_len > 0) {
+            const std::string record_str(record, record_len);
+            const size_t sep = record_str.find('\x1f');
+            const std::string role = sep == std::string::npos
+                ? std::string("user")
+                : record_str.substr(0, sep);
+            const std::string content = sep == std::string::npos
+                ? record_str
+                : record_str.substr(sep + 1);
+
+            role_storage.push_back(role);
+            content_storage.push_back(content);
+            chat.push_back(
+                llama_chat_message{ role_storage.back().c_str(),
+                                    content_storage.back().c_str() });
+        }
+
+        if (record_end == nullptr) {
+            break;
+        }
+        record = record_end + 1;
+    }
+
+    if (chat.empty()) {
+        set_error("At least one chat message is required.");
+        return -2;
+    }
+
+    // First pass: measure the required buffer size.
+    const int32_t needed = llama_chat_apply_template(
+        tmpl, chat.data(), chat.size(), true, nullptr, 0);
+    if (needed < 0) {
+        set_error("The model chat template rejected the conversation.");
+        return -5;
+    }
+
+    if (needed > output_capacity) {
+        set_error("The formatted chat prompt exceeds the output buffer.");
+        return -6;
+    }
+
+    const int32_t written = llama_chat_apply_template(
+        tmpl, chat.data(), chat.size(), true,
+        reinterpret_cast<char *>(output), output_capacity);
+    if (written < 0) {
+        set_error("Failed to apply the model chat template.");
+        return -7;
+    }
+
+    return written;
+    } catch (const std::exception & e) {
+        set_error(std::string("lcw_format_chat_mm: ") + e.what());
         return -100;
     }
 }

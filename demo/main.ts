@@ -1,9 +1,10 @@
 import {
   LFM25_230M_Q4_K_M,
   LFM25_1_2B_INSTRUCT_Q4_K_M,
+  GEMMA4_E2B_IT_Q4_0,
   LlamaCppWasm
 } from "../src/index.ts";
-import type { ChatMessage, ModelInfo, ModelPreset } from "../src/index.ts";
+import type { ChatImage, ChatMessage, ModelInfo, ModelPreset } from "../src/index.ts";
 import { renderMarkdown } from "./markdown.ts";
 
 const DEFAULT_MAX_TOKENS = 512;
@@ -11,7 +12,8 @@ const DEFAULT_TEMPERATURE = 0.7;
 
 const PRESETS: Record<string, ModelPreset> = {
   LFM25_230M_Q4_K_M,
-  LFM25_1_2B_INSTRUCT_Q4_K_M
+  LFM25_1_2B_INSTRUCT_Q4_K_M,
+  GEMMA4_E2B_IT_Q4_0
 };
 
 interface Conversation {
@@ -43,6 +45,7 @@ const chatStatus = getElement<HTMLElement>("chatStatus");
 const messagesEl = getElement<HTMLElement>("messages");
 const composer = getElement<HTMLFormElement>("composer");
 const promptInput = getElement<HTMLTextAreaElement>("prompt");
+const attachInput = getElement<HTMLInputElement>("attach");
 const sendButton = getElement<HTMLButtonElement>("send");
 const cancelButton = getElement<HTMLButtonElement>("cancel");
 const newChatButton = getElement<HTMLButtonElement>("newChat");
@@ -52,6 +55,8 @@ let engine: LlamaCppWasm | undefined;
 let busy = false;
 let conversations: Conversation[] = [];
 let active: Conversation | undefined;
+// A decoded image queued for the next user turn (one image per turn).
+let pendingImage: ChatImage | undefined;
 
 modelSelect.addEventListener("change", () => {
   customModelField.classList.toggle("hidden", modelSelect.value !== "custom");
@@ -80,12 +85,13 @@ loadLfmButton.addEventListener("click", async () => {
     batchInput.value = String(preset.recommendedBatchSize);
   }
 
-  await loadSource(source, label);
+  await loadSource(source, label, choice !== "custom" ? PRESETS[choice].mmproj : undefined);
 });
 
 async function loadSource(
   source: { file: File } | { url: string },
-  label: string
+  label: string,
+  mmproj?: { url: string }
 ): Promise<void> {
   setSetupBusy(true);
   status.textContent = "Initializing WASM…";
@@ -121,14 +127,16 @@ async function loadSource(
           (update.totalBytes > 0
             ? " / " + formatBytes(update.totalBytes)
             : "");
-      }
+      },
+      mmproj ? { url: mmproj.url } : undefined
     );
 
     progress.value = 1;
     status.textContent =
       "Loaded " + formatBytes(info.bytesWritten) + ". " +
       "Context " + info.contextSize + ", batch " + info.batchSize + ", " +
-      "threads " + info.threads + ".";
+      "threads " + info.threads +
+      (info.mmprojLoaded ? ", vision enabled" : ".") + ".";
 
     modelLabel.textContent = label;
     conversations = [];
@@ -221,7 +229,7 @@ function selectConversation(conversation: Conversation): void {
 function renderHistory(history: ChatMessage[]): void {
   messagesEl.replaceChildren();
   for (const message of history) {
-    appendMessage(message.role, message.content);
+    appendMessage(message.role, message.content, message.images);
   }
 }
 
@@ -251,6 +259,24 @@ function deleteConversation(conversation: Conversation): void {
 composer.addEventListener("submit", async event => {
   event.preventDefault();
   await sendMessage();
+});
+
+// Decode the chosen image file to raw RGB (length == width * height * 3) so it
+// can be passed straight to the mtmd bitmap path on the worker. Each user turn
+// holds at most one image, matching the single-marker constraint of
+// lcw_eval_image.
+attachInput.addEventListener("change", async () => {
+  const file = attachInput.files?.[0];
+  if (!file) {
+    pendingImage = undefined;
+    return;
+  }
+  try {
+    pendingImage = await decodeImageToRgb(file);
+  } catch {
+    pendingImage = undefined;
+    alert("Could not decode the selected image.");
+  }
 });
 
 promptInput.addEventListener("keydown", event => {
@@ -318,17 +344,31 @@ async function sendMessage(): Promise<void> {
   }
 
   const text = promptInput.value.trim();
-  if (text === "") {
+  if (text === "" && pendingImage === undefined) {
     return;
   }
 
-  if (active.title === "New chat") {
+  if (active.title === "New chat" && text !== "") {
     active.title = text.slice(0, 40);
     renderConversationList();
   }
 
-  active.history.push({ role: "user", content: text });
-  appendMessage("user", text);
+  const images: ChatImage[] = pendingImage ? [pendingImage] : [];
+  pendingImage = undefined;
+  attachInput.value = "";
+
+  // Gemma 4 (and most chat templates) expect the user turn to carry text after
+  // the media marker. When only an image is attached, substitute a default
+  // caption so the rendered turn is never empty and the model gets a real
+  // instruction.
+  const hasText = text !== "";
+  const promptText = hasText ? text : "Describe this image.";
+  active.history.push({
+    role: "user",
+    content: promptText,
+    images: images.length > 0 ? images : undefined
+  });
+  appendMessage("user", promptText, images);
 
   promptInput.value = "";
   autoGrow(promptInput);
@@ -443,7 +483,11 @@ async function sendMessage(): Promise<void> {
   }
 }
 
-function appendMessage(role: ChatMessage["role"], content: string): HTMLElement {
+function appendMessage(
+  role: ChatMessage["role"],
+  content: string,
+  images?: ChatImage[]
+): HTMLElement {
   const row = document.createElement("div");
   row.className = "message " + role;
 
@@ -456,8 +500,13 @@ function appendMessage(role: ChatMessage["role"], content: string): HTMLElement 
 
   const body = document.createElement("div");
   body.className = "content";
+  if (images && images.length > 0) {
+    for (const image of images) {
+      body.appendChild(renderImageThumbnail(image));
+    }
+  }
   if (content !== "") {
-    body.innerHTML = renderMarkdown(content);
+    body.innerHTML = (body.innerHTML ? body.innerHTML + "<br/>" : "") + renderMarkdown(content);
   }
 
   bubble.appendChild(label);
@@ -467,6 +516,36 @@ function appendMessage(role: ChatMessage["role"], content: string): HTMLElement 
   scrollToBottom();
 
   return body;
+}
+
+// Render raw RGB pixels (length === width * height * 3) as a small thumbnail by
+// stamping them into an ImageData and drawing onto a 2D canvas, then exporting
+// the canvas as a data URL. Used by both the live composer and renderHistory.
+function renderImageThumbnail(image: ChatImage): HTMLImageElement {
+  const canvas = document.createElement("canvas");
+  canvas.width = image.width;
+  canvas.height = image.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    return document.createElement("img");
+  }
+  const rgba = new Uint8ClampedArray(image.width * image.height * 4);
+  for (let i = 0, j = 0; i < image.data.length; i += 3, j += 4) {
+    rgba[j] = image.data[i];
+    rgba[j + 1] = image.data[i + 1];
+    rgba[j + 2] = image.data[i + 2];
+    rgba[j + 3] = 255;
+  }
+  ctx.putImageData(new ImageData(rgba, image.width, image.height), 0, 0);
+  const img = document.createElement("img");
+  img.src = canvas.toDataURL("image/png");
+  img.className = "chat-image";
+  img.alt = "Attached image";
+  // Constrain the thumbnail's display size via inline styles; CSS sizing keeps
+  // the actual pixels until the data URL is decoded.
+  img.style.maxWidth = "200px";
+  img.style.maxHeight = "200px";
+  return img;
 }
 
 function setBusy(value: boolean): void {
@@ -536,6 +615,35 @@ function formatBytes(bytes: number): string {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+// Decode an image File into raw RGB pixels. We draw it onto a 2D canvas and
+// read back the 8-bit RGBA buffer, then drop the alpha channel. The plane is
+// height x width x 3, matching mtmd_bitmap_init's RGBRGB... expectation.
+async function decodeImageToRgb(file: File): Promise<ChatImage> {
+  const bitmap = await createImageBitmap(file);
+  try {
+    const width = bitmap.width;
+    const height = bitmap.height;
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      throw new Error("Canvas 2D context unavailable.");
+    }
+    ctx.drawImage(bitmap, 0, 0, width, height);
+    const rgba = ctx.getImageData(0, 0, width, height).data;
+    const data = new Uint8Array(width * height * 3);
+    for (let i = 0, j = 0; i < rgba.length; i += 4, j += 3) {
+      data[j] = rgba[i];
+      data[j + 1] = rgba[i + 1];
+      data[j + 2] = rgba[i + 2];
+    }
+    return { data, width, height };
+  } finally {
+    bitmap.close();
+  }
 }
 
 /**

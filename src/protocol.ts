@@ -27,6 +27,11 @@ export type WorkerRequest =
       requestId: number;
       source: ModelSource;
       options: Required<LoadOptions>;
+      /**
+       * Optional multimodal projection file (mmproj GGUF). When present the
+       * worker loads it after the main model so the runtime can accept images.
+       */
+      mmproj?: ModelSource;
     }
   | {
       type: "generate";
