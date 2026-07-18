@@ -22,7 +22,7 @@ set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_UI OFF CACHE BOOL "" FORCE)
 set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
-set(LLAMA_WASM_MEM64 OFF CACHE BOOL "" FORCE)
+set(LLAMA_WASM_MEM64 ON CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_HTML OFF CACHE BOOL "" FORCE)
 
 # Multimodal support: the vendored llama.cpp gates tools/mtmd behind an
@@ -49,6 +49,7 @@ set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
 # files serves both builds. Applied as a directory-scope option BEFORE
 # add_subdirectory so the vendored targets inherit it.
 add_compile_options(-pthread)
+add_compile_options("SHELL:-sMEMORY64=1")
 
 add_subdirectory(vendor/llama.cpp)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/mtmd-shim.cmake)
@@ -60,6 +61,7 @@ set(LCW_LINK_OPTIONS_COMMON
     -O3
     -msimd128
     "SHELL:-sNO_DISABLE_EXCEPTION_CATCHING=1"
+    "SHELL:-sMEMORY64=1"
     "SHELL:-sMODULARIZE=1"
     "SHELL:-sEXPORT_ES6=1"
     "SHELL:-sEXPORT_NAME=createLlamaCppWasmModule"
@@ -67,7 +69,7 @@ set(LCW_LINK_OPTIONS_COMMON
     "SHELL:-sNO_EXIT_RUNTIME=1"
     "SHELL:-sALLOW_MEMORY_GROWTH=1"
     "SHELL:-sINITIAL_MEMORY=268435456"
-    "SHELL:-sMAXIMUM_MEMORY=4294967296"
+    "SHELL:-sMAXIMUM_MEMORY=8589934592"
     "SHELL:-sSTACK_SIZE=5242880"
     "SHELL:-sFORCE_FILESYSTEM=1"
     "SHELL:-sEXPORTED_FUNCTIONS=['_malloc','_free',\
