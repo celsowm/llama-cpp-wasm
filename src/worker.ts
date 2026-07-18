@@ -57,6 +57,7 @@ interface Bindings {
     threads: number
   ): number;
   mmprojLoaded(): number;
+  modelHasChatTemplate(): number;
   evalImage(
     prompt: string,
     rgbPointer: number,
@@ -81,7 +82,6 @@ interface Bindings {
     outputCapacity: number,
     maxTokens: number
   ): number;
-  finished(): number;
   resetKV(): void;
   unload(): void;
   lastError(): number;
@@ -107,7 +107,28 @@ const MODEL_DIRECTORY = "/models";
 const MODEL_PATH = `${MODEL_DIRECTORY}/model.gguf`;
 const MMPROJ_PATH = `${MODEL_DIRECTORY}/mmproj.gguf`;
 const OUTPUT_CAPACITY = 8192;
-const CHUNK_TOKENS = 8;
+
+// Per-chunk token budget. The ST build runs at ~5 tok/s on the 1.2B model,
+// so a small budget keeps cancel latency bounded for that path. The MT build
+// decodes substantially faster and the per-chunk overhead (FFI transition,
+// await delay(0), postMessage) dominates at 8 tokens, so we raise the budget
+// there to amortize round-trips. THREADS_MT_THRESHOLD matches the value at
+// which LlamaCppWasm.createThreaded selects the MT artifact.
+const CHUNK_TOKENS_ST = 8;
+const CHUNK_TOKENS_MT = 32;
+const THREADS_MT_THRESHOLD = 2;
+
+// Reusable TextDecoder for the chat-formatter paths. The streaming generate
+// path keeps its own decoder at the call site because the {stream: true}
+// flag carries partial-multibyte state across chunks, which the formatter
+// must not inherit. Hoisted to module scope to avoid per-call allocation.
+const formatterDecoder = new TextDecoder("utf-8", { fatal: false });
+
+// Initial malloc size for the ChatML/template formatter output buffer. Grown
+// on demand when the native side reports it needs more room (negative
+// required-size return), so long conversations no longer crash with the old
+// fixed 64 KiB cap.
+const FORMATTER_BUFFER_INITIAL = 65536;
 
 // Auto-unlink the MEMFS model file as soon as llama.cpp has finished loading the
 // tensors. The GGUF bytes are no longer needed by llama.cpp when
@@ -124,6 +145,12 @@ let moduleInstance: LlamaModule | undefined;
 let bindings: Bindings | undefined;
 let activeGenerationId: number | undefined;
 let cancelRequested = false;
+
+// Thread count from the last successful load. Used to pick the per-chunk
+// token budget for the generation loop: the MT build (threads >= 2) decodes
+// fast enough that a larger budget amortizes per-chunk FFI overhead, while the
+// ST build keeps the small budget so cancel latency stays bounded.
+let loadedThreads = 1;
 
 scope.addEventListener("message", event => {
   void dispatch(event.data as WorkerRequest);
@@ -237,6 +264,12 @@ async function initialize(
       []
     ) as Bindings["mmprojLoaded"],
 
+    modelHasChatTemplate: cwrap(
+      "lcw_model_has_chat_template",
+      "number",
+      []
+    ) as Bindings["modelHasChatTemplate"],
+
     evalImage: cwrap(
       "lcw_eval_image",
       "number",
@@ -254,12 +287,6 @@ async function initialize(
       "number",
       ["number", "number", "number"]
     ) as Bindings["generateChunk"],
-
-    finished: cwrap(
-      "lcw_finished",
-      "number",
-      []
-    ) as Bindings["finished"],
 
     resetKV: cwrap(
       "lcw_reset_kv",
@@ -338,10 +365,17 @@ async function loadModel(
   native.unload();
   removeModelFile();
 
-  const totalBytesHint =
+  // Pre-grow after we know the real Content-Length (or file size). For URL
+  // sources the size is only available once fetch() returns headers, so the
+  // pre-grow happens inside writeSourceToMemfs the moment totalBytes becomes
+  // known but BEFORE the streaming copy begins. For file sources the size is
+  // available up front and the same hook fires synchronously. Growing here
+  // once avoids the several incremental memory.grow memmove()s that
+  // Emscripten would otherwise trigger while copying a ~731 MiB model.
+  const sumBytesHint =
     sourceSizeHint(message.source) + (message.mmproj ? sourceSizeHint(message.mmproj) : 0);
-  if (totalBytesHint > 0) {
-    preGrowHeap(module, totalBytesHint);
+  if (sumBytesHint > 0) {
+    preGrowHeap(module, sumBytesHint);
   }
 
   const bytesWritten = await writeSourceToMemfs(
@@ -354,6 +388,14 @@ async function loadModel(
         loadedBytes,
         totalBytes
       });
+    },
+    (totalBytes) => {
+      // totalBytes is the authoritative size once Content-Length is known.
+      // For URL sources this fires after fetch() resolves (later than
+      // sumBytesHint, which was 0). Pre-grow now using the real value.
+      if (totalBytes > 0) {
+        preGrowHeap(module, totalBytes);
+      }
     }
   );
 
@@ -388,6 +430,11 @@ async function loadModel(
           loadedBytes,
           totalBytes
         });
+      },
+      (totalBytes) => {
+        if (totalBytes > 0) {
+          preGrowHeap(module, totalBytes);
+        }
       }
     );
 
@@ -419,6 +466,7 @@ async function loadModel(
       mmprojLoaded
     }
   });
+  loadedThreads = message.options.threads;
 }
 
 async function generate(
@@ -498,21 +546,29 @@ async function generate(
 
   const pointer = module._malloc(OUTPUT_CAPACITY);
   const decoder = new TextDecoder("utf-8", { fatal: false });
-  const heapView = module.HEAPU8;
+
+  // MT build: threads >= THREADS_MT_THRESHOLD. ST build: threads == 1. Use the
+  // chunk budget that amortizes per-chunk FFI overhead on the MT path while
+  // keeping cancel latency low on the ST path.
+  const chunkTokens = loadedThreads >= THREADS_MT_THRESHOLD
+    ? CHUNK_TOKENS_MT
+    : CHUNK_TOKENS_ST;
 
   try {
     while (!cancelRequested) {
-      const result = native.generateChunk(pointer, OUTPUT_CAPACITY, CHUNK_TOKENS);
+      const result = native.generateChunk(pointer, OUTPUT_CAPACITY, chunkTokens);
 
       if (result < 0) {
         throw new Error(readNativeError());
       }
 
       if (result > 0) {
-        const text = decoder.decode(
-          new Uint8Array(heapView.buffer, pointer, result),
-          { stream: true }
-        );
+        // Re-read HEAPU8 each iteration so the view always wraps the current
+        // wasmMemory.buffer (defensive against any future heap growth inside
+        // the native call). The native chunk path does not grow today, but
+        // keeping the view fresh is cheap and avoids a latent footgun.
+        const view = new Uint8Array(module.HEAPU8.buffer, pointer, result);
+        const text = decoder.decode(view, { stream: true });
         if (text.length > 0) {
           post({
             type: "token",
@@ -522,15 +578,19 @@ async function generate(
         }
       }
 
-      if (native.finished() !== 0) {
+      // lcw_generate_chunk returns 0 only when generation is finished for this
+      // chunk AND overall (EOS or max_tokens reached). The contract guarantees
+      // we never get 0 with more tokens to come, so 0 is the unambiguous
+      // "done" signal: an extra lcw_finished() round-trip would carry no
+      // information.
+      if (result === 0) {
         break;
       }
 
       // Yield to the worker event loop between chunks so a cancel message can
-      // be observed. CHUNK_TOKENS is small enough that this still feels
-      // responsive (a 16-token chunk at ~5 tokens/s on the 1.2B model is
-      // ~3 seconds per native call, which would make cancellation laggy).
-      // The 4-token chunk size keeps latency bounded.
+      // be observed. chunkTokens is bounded (8 on ST, 32 on MT), so the worst
+      // case decode time stays under ~2s on the 1.2B model; the yield keeps
+      // cancel responsive.
       await delay(0);
     }
 
@@ -567,34 +627,68 @@ function readBenchmark(native: Bindings): BenchmarkReport {
   };
 }
 
+// Calls a chat formatter with a growable output buffer. The native formatter
+// returns the number of bytes written on success, or -<required_size> when
+// the supplied buffer is too small (a recoverable signal, not an error). We
+// reuse one malloc slot and retry once with the exact required capacity.
+//
+// Heap aliasing: Emscripten grows memory lazily; we re-read module.HEAPU8
+// after each cwrap call so the Uint8Array view always wraps the current
+// wasmMemory.buffer (the previous slice could have been detached by a grow
+// inside the formatter, though neither formatter grows today). Decoding from
+// a sub-ArrayBuffer view (rather than HEAPU8.slice) skips one byte copy.
+function formatChatVia(
+  formatter: (serialized: string, outputPointer: number, outputCapacity: number) => number,
+  serialized: string
+): string {
+  const module = requireModule();
+
+  let capacity = FORMATTER_BUFFER_INITIAL;
+  let pointer = module._malloc(capacity);
+  try {
+    for (let attempt = 0; attempt < 2; ++attempt) {
+      const length = formatter(serialized, pointer, capacity);
+      if (length >= 0) {
+        const view = new Uint8Array(module.HEAPU8.buffer, pointer, length);
+        return formatterDecoder.decode(view);
+      }
+      // Negative return = required size (negated). Grow and retry once.
+      const needed = -length;
+      if (needed <= 0) {
+        throw new Error(readNativeError());
+      }
+      module._free(pointer);
+      capacity = needed;
+      pointer = module._malloc(capacity);
+    }
+    throw new Error(readNativeError());
+  } finally {
+    module._free(pointer);
+  }
+}
+
 function formatChatPrompt(
   messages: NonNullable<Extract<WorkerRequest, { type: "generate" }>["chatMessages"]>
 ): string {
-  const module = requireModule();
   const native = requireBindings();
 
   // Serialize the full conversation. Each record is "role<US>content" joined by
-  // <RS>. The native side turns this into a ChatML prompt with one turn per
-  // message and an assistant generation prefix at the end. This path is only
-  // reached when no images are present (see formatChatPromptWithImage for the
-  // multimodal case), so the content is plain text with no media marker.
+  // <RS>. The native side turns this into a prompt with one turn per message
+  // plus an assistant generation prefix at the end.
   const serialized = messages
     .map(message => `${message.role}\x1f${message.content}`)
     .join("\x1e");
 
-  const pointer = module._malloc(65536);
-  try {
-    const length = native.formatChat(serialized, pointer, 65536);
-    if (length < 0) {
-      throw new Error(readNativeError());
-    }
-    const decoded = new TextDecoder().decode(
-      module.HEAPU8.slice(pointer, pointer + length)
-    );
-    return decoded;
-  } finally {
-    module._free(pointer);
-  }
+  // Prefer the model's own chat template (lcw_format_chat_mm) when the model
+  // exposes one. The hardcoded ChatML fallback (lcw_format_chat_multi) mangles
+  // any non-ChatML tokenizer_config; the default presets (LFM2-Instruct) are
+  // ChatML-compatible so they render identically through both paths, but a
+  // user-supplied GGUF with a different template (Llama 3, Mistral, etc.)
+  // must be formatted by its own template for correct generation.
+  const formatter = native.modelHasChatTemplate() === 1
+    ? native.formatChatMm
+    : native.formatChat;
+  return formatChatVia(formatter, serialized);
 }
 
 // The mtmd default media marker ("<__media__>") inserted into the prompt at the
@@ -626,7 +720,6 @@ function lastUserImages(
 function formatChatPromptWithImage(
   messages: NonNullable<Extract<WorkerRequest, { type: "generate" }>["chatMessages"]>
 ): string {
-  const module = requireModule();
   const native = requireBindings();
 
   const serialized = messages
@@ -639,19 +732,10 @@ function formatChatPromptWithImage(
     })
     .join("\x1e");
 
-  const pointer = module._malloc(65536);
-  try {
-    const formatter = native.mmprojLoaded() === 1
-      ? native.formatChatMm
-      : native.formatChat;
-    const length = formatter(serialized, pointer, 65536);
-    if (length < 0) {
-      throw new Error(readNativeError());
-    }
-    return new TextDecoder().decode(module.HEAPU8.slice(pointer, pointer + length));
-  } finally {
-    module._free(pointer);
-  }
+  const formatter = native.mmprojLoaded() === 1
+    ? native.formatChatMm
+    : native.formatChat;
+  return formatChatVia(formatter, serialized);
 }
 
 // Returns a best-effort lower bound on the GGUF byte size before the actual
@@ -696,7 +780,8 @@ function preGrowHeap(module: LlamaModule, modelBytes: number): void {
 async function writeSourceToMemfs(
   fs: EmscriptenFileSystem,
   source: ModelSource,
-  progress: (loadedBytes: number, totalBytes: number) => void
+  progress: (loadedBytes: number, totalBytes: number) => void,
+  onTotalBytes?: (totalBytes: number) => void
 ): Promise<number> {
   let totalBytes = 0;
   let reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -724,6 +809,13 @@ async function writeSourceToMemfs(
     } else {
       reader = response.body.getReader();
     }
+  }
+
+  // Fire the size-known hook AFTER totalBytes is set but BEFORE any bytes are
+  // streamed, so the caller can pre-grow the WASM heap once with the real
+  // capacity and avoid incremental growth memmoves during the copy.
+  if (onTotalBytes && totalBytes > 0) {
+    onTotalBytes(totalBytes);
   }
 
   const stream = fs.open(MODEL_PATH, "w");

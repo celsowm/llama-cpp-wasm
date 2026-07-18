@@ -418,15 +418,32 @@ async function sendMessage(): Promise<void> {
   let done = false;
   let startTime = performance.now();
 
-  // Schedule at most one DOM reflow per animation frame. The model produces
-  // several chunks quickly and we must not re-parse the entire accumulated
-  // Markdown on every chunk - the O(n^2) reflow cost dominates long answers.
+  // Re-render throttle: the markdown parser runs in O(length) per frame over
+  // the whole accumulated string, so re-parsing on every chunk is O(n^2) across
+  // the answer. The `dirty` flag already coalesces many chunks into one
+  // animation frame; we additionally cap the full re-parse to at most one every
+  // RENDER_CHUNK_INTERVAL chunks, with a time bound that guarantees the latest
+  // text still shows within ~100ms even when chunks are sparse.
+  const RENDER_CHUNK_INTERVAL = 4;
+  const RENDER_MAX_DELAY_MS = 100;
+  let chunksSinceRender = 0;
+  let lastRenderTime = 0;
+
   const scheduleRender = (): void => {
-    if (dirty || done) return;
+    if (done) return;
+    chunksSinceRender += 1;
+    if (dirty) return;
+
+    const now = performance.now();
+    const overdue = now - lastRenderTime >= RENDER_MAX_DELAY_MS;
+    if (!overdue && chunksSinceRender < RENDER_CHUNK_INTERVAL) return;
+
     dirty = true;
     rafHandle = requestAnimationFrame(() => {
       dirty = false;
       rafHandle = undefined;
+      chunksSinceRender = 0;
+      lastRenderTime = performance.now();
       rendered.innerHTML =
         renderMarkdown(accumulated) + '<span class="caret"></span>';
       scrollToBottom();

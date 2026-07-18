@@ -88,6 +88,7 @@ set(LCW_LINK_OPTIONS_COMMON
 '_lcw_load_mmproj',\
 '_lcw_eval_image',\
 '_lcw_mmproj_loaded',\
+'_lcw_model_has_chat_template',\
 '_lcw_bench_load_ms']"
     "SHELL:-sEXPORTED_RUNTIME_METHODS=['FS','cwrap','HEAPU8','wasmMemory']"
 )
