@@ -65,7 +65,7 @@ export const GEMMA4_E2B_IT_Q4_0: ModelPreset = {
   id: "google-gemma-4-e2b-it-q4-0",
   label: "Google Gemma 4 E2B IT Q4_0 (multimodal)",
   repository: "google/gemma-4-E2B-it-qat-q4_0-gguf",
-  filename: "gemma-4-E2B-it-qat-q4_0.gguf",
+  filename: "gemma-4-E2B_q4_0-it.gguf",
   url: gemma4E2BUrl("gemma-4-E2B-it-qat-q4_0.gguf"),
   recommendedContextSize: 16384,
   recommendedBatchSize: 256,
