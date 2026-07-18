@@ -72,7 +72,7 @@
         </div>
       </aside>
 
-      <div class="chat-main">
+      <div id="chatMain" class="chat-main">
         <header class="chat-header">
           <button id="sidebarReopen" class="icon-btn hidden" type="button" title="Open sidebar" aria-label="Open sidebar">
             &rsaquo;
@@ -89,11 +89,19 @@
 
         <div id="messages" class="messages"></div>
 
+        <div id="dropOverlay" class="drop-overlay hidden">
+          <div class="drop-hint">Drop a PDF to read it</div>
+        </div>
+
         <form id="composer" class="composer">
           <textarea id="prompt" rows="1" placeholder="Send a message…  (Enter to send, Shift+Enter for newline)"></textarea>
           <label id="attachLabel" class="attach" title="Attach an image">
             <input id="attach" type="file" accept="image/*" hidden />
             <span>📎</span>
+          </label>
+          <label id="pdfLabel" class="attach" title="Attach a PDF">
+            <input id="attachPdf" type="file" accept="application/pdf,.pdf" hidden />
+            <span>📄</span>
           </label>
           <button type="submit" id="send">Send</button>
           <button type="button" id="cancel" class="hidden">Stop</button>

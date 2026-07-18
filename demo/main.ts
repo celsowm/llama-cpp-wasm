@@ -6,6 +6,7 @@ import {
 } from "../src/index.ts";
 import type { ChatImage, ChatMessage, ModelInfo, ModelPreset } from "../src/index.ts";
 import { renderMarkdown } from "./markdown.ts";
+import { extractPdfText, type ExtractedPdf } from "./pdf.ts";
 
 const DEFAULT_MAX_TOKENS = 512;
 const DEFAULT_TEMPERATURE = 0.7;
@@ -46,6 +47,9 @@ const messagesEl = getElement<HTMLElement>("messages");
 const composer = getElement<HTMLFormElement>("composer");
 const promptInput = getElement<HTMLTextAreaElement>("prompt");
 const attachInput = getElement<HTMLInputElement>("attach");
+const pdfInput = getElement<HTMLInputElement>("attachPdf");
+const chatMain = getElement<HTMLElement>("chatMain");
+const dropOverlay = getElement<HTMLElement>("dropOverlay");
 const sendButton = getElement<HTMLButtonElement>("send");
 const cancelButton = getElement<HTMLButtonElement>("cancel");
 const newChatButton = getElement<HTMLButtonElement>("newChat");
@@ -57,6 +61,10 @@ let conversations: Conversation[] = [];
 let active: Conversation | undefined;
 // A decoded image queued for the next user turn (one image per turn).
 let pendingImage: ChatImage | undefined;
+// Extracted PDF text queued for the next user turn. Injected as a system
+// message so the model can reason over the document without it appearing as a
+// user bubble.
+let pendingPdf: ExtractedPdf | undefined;
 
 modelSelect.addEventListener("change", () => {
   customModelField.classList.toggle("hidden", modelSelect.value !== "custom");
@@ -279,6 +287,95 @@ attachInput.addEventListener("change", async () => {
   }
 });
 
+pdfInput.addEventListener("change", async () => {
+  const file = pdfInput.files?.[0];
+  if (!file) {
+    pendingPdf = undefined;
+    return;
+  }
+  await queuePdf(file);
+});
+
+// Drag-and-drop: dropping a PDF anywhere over the chat reads it. Image drops are
+// ignored here (use the paperclip) to keep the gesture single-purpose.
+let dragDepth = 0;
+
+chatMain.addEventListener("dragenter", event => {
+  if (!event.dataTransfer?.types.includes("Files")) return;
+  event.preventDefault();
+  dragDepth += 1;
+  if (event.dataTransfer.types.includes("Files")) {
+    dropOverlay.classList.remove("hidden");
+  }
+});
+
+chatMain.addEventListener("dragover", event => {
+  if (!event.dataTransfer?.types.includes("Files")) return;
+  event.preventDefault();
+});
+
+chatMain.addEventListener("dragleave", event => {
+  if (!event.dataTransfer?.types.includes("Files")) return;
+  dragDepth -= 1;
+  if (dragDepth <= 0) {
+    dragDepth = 0;
+    dropOverlay.classList.add("hidden");
+  }
+});
+
+chatMain.addEventListener("drop", async event => {
+  if (!event.dataTransfer?.types.includes("Files")) return;
+  event.preventDefault();
+  dragDepth = 0;
+  dropOverlay.classList.add("hidden");
+  const file = Array.from(event.dataTransfer.files).find(
+    f => f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf")
+  );
+  if (!file) {
+    alert("Drop a PDF file to read its text.");
+    return;
+  }
+  await queuePdf(file);
+});
+
+async function queuePdf(file: File): Promise<void> {
+  try {
+    pendingPdf = await extractPdfText(file);
+    renderAttachmentChip();
+  } catch {
+    pendingPdf = undefined;
+    alert("Could not read the selected PDF.");
+  }
+}
+
+// A small chip above the composer showing the queued PDF, with a way to clear
+// it before sending.
+function renderAttachmentChip(): void {
+  let chip = document.getElementById("pdfChip");
+  if (!pendingPdf) {
+    chip?.remove();
+    return;
+  }
+  if (!chip) {
+    chip = document.createElement("div");
+    chip.id = "pdfChip";
+    chip.className = "pdf-chip";
+    composer.insertBefore(chip, promptInput);
+  }
+  chip.textContent = `📄 ${pendingPdf.fileName} (${pendingPdf.pageCount} pages)`;
+  const clear = document.createElement("button");
+  clear.type = "button";
+  clear.className = "pdf-chip-clear";
+  clear.textContent = "×";
+  clear.title = "Remove PDF";
+  clear.addEventListener("click", () => {
+    pendingPdf = undefined;
+    pdfInput.value = "";
+    renderAttachmentChip();
+  });
+  chip.replaceChildren(document.createTextNode(chip.textContent), clear);
+}
+
 promptInput.addEventListener("keydown", event => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
@@ -357,17 +454,39 @@ async function sendMessage(): Promise<void> {
   pendingImage = undefined;
   attachInput.value = "";
 
+  const pdf = pendingPdf;
+  pendingPdf = undefined;
+  pdfInput.value = "";
+  renderAttachmentChip();
+
   // Gemma 4 (and most chat templates) expect the user turn to carry text after
   // the media marker. When only an image is attached, substitute a default
   // caption so the rendered turn is never empty and the model gets a real
   // instruction.
   const hasText = text !== "";
-  const promptText = hasText ? text : "Describe this image.";
-  active.history.push({
+  const promptText = hasText ? text : (images.length > 0 ? "Describe this image." : "");
+
+  const userTurn: ChatMessage = {
     role: "user",
     content: promptText,
     images: images.length > 0 ? images : undefined
-  });
+  };
+
+  // The PDF is not shown as a chat bubble. It is prepended to the history sent
+  // to the model as a system message so the assistant can answer questions
+  // about the document. Seed a title from the first real user text.
+  const historyToSend: ChatMessage[] = [...active.history];
+  if (pdf) {
+    historyToSend.push({
+      role: "system",
+      content: `The user attached a PDF document named "${pdf.fileName}". ` +
+        `Use the following extracted text to answer questions about it:\n\n` +
+        pdf.text
+    });
+  }
+  historyToSend.push(userTurn);
+
+  active.history.push(userTurn);
   appendMessage("user", promptText, images);
 
   promptInput.value = "";
@@ -451,7 +570,7 @@ async function sendMessage(): Promise<void> {
   };
 
   try {
-    for await (const chunk of engine.chat(active.history, {
+    for await (const chunk of engine.chat(historyToSend, {
       maxTokens: DEFAULT_MAX_TOKENS,
       temperature: DEFAULT_TEMPERATURE,
       topK: 40,

@@ -28,6 +28,9 @@
     "test": "npm run typecheck",
     "build:pages": "npm run build && npm run build:demo"
   },
+  "dependencies": {
+    "pdfjs-dist": "^4.10.38"
+  },
   "devDependencies": {
     "playwright": "^1.61.1",
     "typescript": "^5.9.0",
